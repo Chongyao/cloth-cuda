@@ -1,0 +1,54 @@
+# Build artifacts
+build/
+build-*/
+*.o
+*.obj
+*.a
+*.so
+*.dll
+*.exe
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake-build-*/
+CMakeLists.txt.user
+CMakePresets.json
+CMakeUserPresets.json
+compile_commands.json
+
+# CUDA
+*.i
+*.ii
+*.ptx
+*.fatbin
+*.cubin
+*.gpu
+*.device
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Python (for scripts)
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Outputs
+output/
+frames/
+*.ply
+*.obj.tmp
+
+# Nsight Compute/Graphics
+*.nsys-rep
+*.ncu-rep
+
+# Temporary files
+*.log
+*.tmp
