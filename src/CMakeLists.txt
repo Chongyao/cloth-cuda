@@ -20,6 +20,75 @@ if(HAVE_CUDA)
         $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
 endif()
 
+# ---- FetchContent for dependencies ----
+include(FetchContent)
+
+# GLFW
+FetchContent_Declare(
+    glfw
+    GIT_REPOSITORY https://github.com/glfw/glfw.git
+    GIT_TAG 3.3.8
+    GIT_SHALLOW TRUE
+)
+set(GLFW_BUILD_DOCS OFF CACHE BOOL "" FORCE)
+set(GLFW_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(GLFW_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(glfw)
+
+# ImGui
+FetchContent_Declare(
+    imgui
+    GIT_REPOSITORY https://github.com/ocornut/imgui.git
+    GIT_TAG v1.90
+    GIT_SHALLOW TRUE
+)
+FetchContent_MakeAvailable(imgui)
+
+# GLM (for matrix/vector math)
+FetchContent_Declare(
+    glm
+    GIT_REPOSITORY https://github.com/g-truc/glm.git
+    GIT_TAG 1.0.1
+    GIT_SHALLOW TRUE
+)
+FetchContent_MakeAvailable(glm)
+
+# Create ImGui library with GLFW+OpenGL3 backends
+add_library(imgui_glfw STATIC
+    ${imgui_SOURCE_DIR}/imgui.cpp
+    ${imgui_SOURCE_DIR}/imgui_draw.cpp
+    ${imgui_SOURCE_DIR}/imgui_tables.cpp
+    ${imgui_SOURCE_DIR}/imgui_widgets.cpp
+    ${imgui_SOURCE_DIR}/backends/imgui_impl_glfw.cpp
+    ${imgui_SOURCE_DIR}/backends/imgui_impl_opengl3.cpp
+)
+target_link_libraries(imgui_glfw PUBLIC glfw)
+target_include_directories(imgui_glfw PUBLIC
+    ${imgui_SOURCE_DIR}
+    ${imgui_SOURCE_DIR}/backends
+)
+
+# ---- Viewer library ----
+add_library(viewer STATIC
+    viewer/viewer.cpp
+    viewer/camera.cpp
+    viewer/shader.cpp
+    viewer/glad/glad.c
+)
+target_link_libraries(viewer PUBLIC
+    cuda_ms_core
+    glfw
+    imgui_glfw
+    glm
+)
+target_include_directories(viewer PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/viewer
+)
+
+# Link OpenGL
+find_package(OpenGL REQUIRED)
+target_link_libraries(viewer PUBLIC OpenGL::GL)
+
 # ---- Simulation main ----
 add_executable(cuda_ms main.cpp)
 target_link_libraries(cuda_ms PRIVATE cuda_ms_core)
@@ -27,6 +96,9 @@ target_link_libraries(cuda_ms PRIVATE cuda_ms_core)
 # ---- Tools ----
 add_executable(gen_cloth tools/gen_cloth.cpp)
 target_link_libraries(gen_cloth PRIVATE cuda_ms_core)
+
+add_executable(view_cloth tools/view_cloth.cpp)
+target_link_libraries(view_cloth PRIVATE viewer)
 
 # ---- Tests ----
 foreach(t test_mesh test_topology test_constraints)

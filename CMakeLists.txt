@@ -5,10 +5,10 @@ include(CheckLanguage)
 check_language(CUDA)
 
 if(CMAKE_CUDA_COMPILER)
-    project(cuda_ms LANGUAGES CXX CUDA)
+    project(cuda_ms LANGUAGES C CXX CUDA)
     set(HAVE_CUDA TRUE)
 else()
-    project(cuda_ms LANGUAGES CXX)
+    project(cuda_ms LANGUAGES C CXX)
     set(HAVE_CUDA FALSE)
 endif()
 
