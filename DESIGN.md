@@ -1,611 +1,460 @@
-# CUDA FEM 布料仿真框架设计文档
+# CUDA Projective Dynamics 布料仿真框架设计文档
 
 > 作者：仿真工程师视角
-> 版本：v0.2
-> 目标：基于 CUDA 的 FEM 三角面片布料仿真，暂不考虑碰撞处理
+> 版本：v0.3
+> 目标：基于 CUDA 的 Projective Dynamics 布料仿真，暂不处理碰撞
 
 ---
 
 ## 一、理论基础概述
 
-### 1.1 问题描述
+### 1.1 Projective Dynamics 核心思想
 
-布料建模为嵌入三维空间的二维薄壳。我们将布料离散为三角形网格：
-
-- **参考构型（Reference / Rest Configuration）**：布料静止时的形状，定义在材料空间（2D 或展平的 3D 坐标）
-- **当前构型（Deformed Configuration）**：仿真过程中的世界坐标（3D）
-
-对每个三角形，FEM 的核心任务是：
-1. 计算变形梯度 **F**（3×2 矩阵，从材料空间到世界空间）
-2. 由本构模型计算应变能密度 Ψ(F)
-3. 计算弹性力（能量对节点位置的梯度）
-4. （隐式积分时）计算切线刚度矩阵（能量的 Hessian）
-
-### 1.2 变形梯度
-
-设三角形三顶点在参考构型中的 2D 坐标为 X₁, X₂, X₃ ∈ ℝ²，在当前构型中的 3D 坐标为 x₁, x₂, x₃ ∈ ℝ³。
-
-定义参考边矩阵（2×2）：
-```
-D_m = [X₂ - X₁ | X₃ - X₁]    (2×2)
-```
-
-当前构型边矩阵（3×2）：
-```
-D_s = [x₂ - x₁ | x₃ - x₁]    (3×2)
-```
-
-变形梯度（3×2）：
-```
-F = D_s · D_m⁻¹               (3×2)
-```
-
-注意：D_m 是方阵可直接求逆，且在预处理阶段计算一次即可存储。
-
-### 1.3 本构模型（膜力）
-
-#### St. Venant-Kirchhoff（StVK）
-
-Green 应变张量（2×2）：
-```
-E = (FᵀF - I) / 2
-```
-
-应变能密度：
-```
-Ψ = (λ/2) tr(E)² + μ tr(EᵀE)
-```
-
-其中 λ, μ 为 Lamé 参数，可由杨氏模量 E_Y 与泊松比 ν 换算：
-```
-λ = E_Y·ν / ((1+ν)(1-2ν))
-μ = E_Y / (2(1+ν))
-```
-
-StVK 对大压缩不稳定，但对布料的小至中等形变已经足够。
-
-#### Neo-Hookean（备选，更稳健）
+PD 将隐式积分中的能量最小化问题转化为**约束投影问题**：
 
 ```
-Ψ = (μ/2)(tr(FᵀF) - 2) - μ·ln(J) + (λ/2)·ln(J)²
+x_{n+1} = argmin  (1/2h²)||x - y||²_M + Σ w_i ||A_i x - p_i||²
+
+其中 y = x_n + h·v_n + h²·M⁻¹·f_ext  (惯性预测位置)
 ```
 
-其中 J = sqrt(det(FᵀF)) 为面积比。对布料偏好 StVK 或各向异性模型，Neo-Hookean 更适合体积仿真，但也可用。
+- **Local Step**: 对每个约束计算投影 `p_i = projection(A_i x)` —— 完全并行
+- **Global Step**: 求解固定线性系统 `(M + h²L)x = M y + h² Σ w_i A_i^T p_i`
 
-### 1.4 弯曲模型
+系统矩阵 `A = (M + h²L)` 是**常数矩阵**，可预分解或预计算，每帧只需回代。
 
-纯膜力（in-plane）不产生抵抗弯折的力。布料的弯曲通过**离散铰链弹簧**（Discrete Hinge / Dihedral Angle）建模：
+### 1.2 布料约束类型
 
-对每条内边（连接两个三角形的共享边），计算相邻三角形的二面角θ，弯曲能量：
+| 约束 | 类型 | 投影算子 |
+|------|------|----------|
+| 拉伸 | 边长度 | 将当前边向量投影到目标长度 |
+| 弯曲 | 二面角 | 将4个顶点投影到目标二面角 |
+
+#### 拉伸约束
+对边 `(i,j)`，目标长度 `L_rest`：
 ```
-E_bend = k_bend · (θ - θ_rest)² · l_e / (A₁ + A₂)
-```
-
-其中 l_e 为边长，A₁, A₂ 为两三角形面积。
-
-> 弯曲力的推导较膜力复杂，将在实现阶段详细展开。
-
-### 1.5 时间积分
-
-#### 显式 Newmark / Verlet（入门首选）
-
-```
-v_{n+1/2} = v_n + (Δt/2) · a_n
-x_{n+1}   = x_n + Δt · v_{n+1/2}
-a_{n+1}   = M⁻¹ · f(x_{n+1})
-v_{n+1}   = v_{n+1/2} + (Δt/2) · a_{n+1}
+p = (x_i + x_j)/2 ± (L_rest/2) · (x_j - x_i)/|x_j - x_i|
 ```
 
-优点：实现简单，CUDA 完全并行。
-缺点：条件稳定，时间步长受材料刚度限制（Δt < 2/ω_max，其中 ω_max 为最大频率）。
-
-#### 隐式 Backward Euler（生产首选）
-
-求解：
+#### 弯曲约束
+对共享边 `(i,j)` 的两个三角形，参考二面角 `θ_rest`：
 ```
-M·(x_{n+1} - 2x_n + x_{n-1}) / Δt² = f(x_{n+1})
+通过旋转使当前二面角 = θ_rest，然后投影4个顶点
 ```
 
-等价于求解非线性方程组，通常用 Newton 法线性化：
-```
-(M/Δt² - K(x_k)) · Δx = f(x_k) - M·(x_k - 2x_n + x_{n-1}) / Δt²
-```
+### 1.3 线性求解策略
 
-每个 Newton 步需在 GPU 上求解稀疏线性系统，使用**共轭梯度法（PCG）**。
+PD 的 Global Step 需求解 `A x = b`。策略演进：
+
+| 方法 | 复杂度 | 适合场景 |
+|------|--------|----------|
+| Jacobi | O(k·N) 每帧，k次迭代 | GPU 友好，易实现 |
+| Jacobi + Chebyshev | O(k·N)，收敛更快 | 推荐默认方案 |
+| 预分解直接求解 | O(N) 每帧，预计算O(N³) | 小网格，固定拓扑 |
+
+**本框架采用 Jacobi + Chebyshev 加速**，GPU 友好且无需稀疏矩阵库。
+
+### 1.4 时间积分流程
+
+```
+每帧:
+1. 预测位置: y = x_n + h·v_n + h²·f_ext/m
+2. For iteration = 0 to max_iter:
+   a. Local Step (并行):  p_i = project_constraint(x)
+   b. Global Step (Jacobi): x = (M y + h² Σ A_i^T p_i) / (M + h² Σ A_i^T A_i)
+   c. Chebyshev 加速更新
+3. 更新速度: v_{n+1} = (x_{n+1} - x_n) / h
+4. 应用约束: 固定点位置重置
+```
 
 ---
 
 ## 二、模块划分
 
 ```
-cuda-cloth-sim/
+cuda-ms/
 ├── CMakeLists.txt
 ├── include/
 │   ├── mesh.h              # 网格数据结构
 │   ├── mesh_generator.h    # 程序化网格生成
-│   ├── constraints.h       # 约束管理
-│   ├── material.h          # 本构模型参数与接口
-│   ├── fem_engine.h        # FEM 力/刚度计算接口
-│   ├── bending.h           # 弯曲力计算接口
-│   ├── sparse_matrix.h     # GPU 稀疏矩阵（CSR）
-│   ├── linear_solver.h     # GPU 共轭梯度求解器
-│   ├── integrator.h        # 时间积分器接口
-│   ├── simulation.h        # 顶层仿真管理器
-│   └── viewer.h            # OpenGL 可视化
+│   ├── constraints.h       # 固定约束管理
+│   ├── material.h          # 材料参数 (拉伸/弯曲刚度)
+│   ├── pd_solver.h         # PD 求解器核心
+│   ├── simulation.h        # 顶层仿真管理
+│   └── viewer.h            # OpenGL 可视化 (Phase 2.5 已实现)
 ├── src/
 │   ├── CMakeLists.txt
 │   ├── mesh.cpp            # 网格 IO、拓扑构建
 │   ├── mesh_generator.cpp  # 程序化生成方形布料
 │   ├── constraints.cpp     # 约束应用
-│   ├── fem_engine.cu       # CUDA 核函数：力/刚度
-│   ├── bending.cu          # CUDA 核函数：弯曲力
-│   ├── sparse_matrix.cu    # CSR 构建
-│   ├── linear_solver.cu    # PCG 求解器
-│   ├── integrator.cu       # 显式/隐式积分器
+│   ├── pd_solver.cu        # CUDA: Local/Global Step
 │   ├── simulation.cpp      # 主循环
-│   ├── viewer.cpp          # OpenGL 渲染
-│   └── utils/              # 工具函数
+│   ├── viewer/             # Phase 2.5 已实现的 viewer
+│   └── utils/
 │       ├── obj_io.h/cpp
 │       └── cuda_helper.h
 └── shaders/                # GLSL 着色器
-    ├── phong.vs
-    └── phong.fs
 ```
 
 ---
 
 ## 三、各模块详细设计
 
-### 3.1 Mesh 模块
-
-#### 数据结构
+### 3.1 Mesh 模块 (已存在，需扩展)
 
 ```cpp
-// include/mesh.h
+// include/mesh.h (新增约束相关)
 
 struct ClothMesh {
-    // --- CPU 端原始数据（预处理用）---
-    std::vector<Eigen::Vector3f> rest_pos;    // 参考构型顶点
-    std::vector<Eigen::Vector3i> triangles;   // 三角形顶点索引
-    std::vector<Eigen::Vector4i> inner_edges; // 内边（弯曲用）：(v0, v1, v2, v3)
-                                              // v0-v1 是共享边，v2/v3 是对顶点
+    // === CPU 端 ===
+    std::vector<Eigen::Vector3f> rest_pos;
+    std::vector<Eigen::Vector3i> triangles;
 
-    // --- 预计算量（每个三角形）---
-    std::vector<Eigen::Matrix2f> Dm_inv;      // D_m 的逆 (2×2)
-    std::vector<float>           rest_area;   // 参考构型面积
-    std::vector<float>           mass;        // 节点质量
+    // 拉伸约束: (v0, v1, rest_length, stiffness)
+    std::vector<Eigen::Vector4f> stretch_constraints;
 
-    // --- 弯曲预计算 ---
-    std::vector<float>           rest_angles; // 参考二面角
-    std::vector<float>           edge_lengths;// 共享边长度
+    // 弯曲约束: (v0, v1, v2, v3, rest_angle, stiffness)
+    // v0-v1 是共享边，v2/v3 是对顶点
+    std::vector<float> bend_rest_angles;
+    std::vector<float> bend_stiffness;
+    std::vector<Eigen::Vector4i> bend_quads;
 
-    // --- GPU 端镜像 ---
-    float*  d_pos;          // [N×3]
-    float*  d_vel;          // [N×3]
-    float*  d_force;        // [N×3]
-    int*    d_tris;         // [T×3]
-    int*    d_inner_edges;  // [E×4]
-    float*  d_Dm_inv;       // [T×4]
-    float*  d_rest_area;    // [T]
-    float*  d_mass;         // [N]
-    float*  d_rest_angles;  // [E]
-    float*  d_edge_lengths; // [E]
+    // === GPU 端 ===
+    float* d_pos;           // [N×3] 当前位置
+    float* d_vel;           // [N×3] 速度
+    float* d_prev_pos;      // [N×3] 上一帧位置 (Chebyshev 需要)
+    float* d_mass;          // [N] 质量
+
+    // 约束 GPU 数据
+    int* d_stretch_edges;   // [E_stretch×2] 顶点索引
+    float* d_stretch_rest;  // [E_stretch] 目标长度
+    float* d_stretch_k;     // [E_stretch] 刚度
+
+    int* d_bend_quads;      // [E_bend×4] 顶点索引 (v0,v1,v2,v3)
+    float* d_bend_rest;     // [E_bend] 目标二面角
+    float* d_bend_k;        // [E_bend] 刚度
+
+    // Jacobi 求解辅助
+    float* d_mass_lumped;   // [N] M_ii + h² * (Σ w_i * A_i^T A_i)_ii
 
     int num_verts;
-    int num_tris;
-    int num_inner_edges;
+    int num_stretch_cons;
+    int num_bend_cons;
 };
 ```
 
-#### 关键操作
+**新增方法**:
+- `build_stretch_constraints()` — 从三角形生成边约束
+- `build_bend_constraints()` — 从内边生成弯曲约束
+- `precompute_jacobi_diagonal()` — 预计算 Jacobi 迭代的分母
 
-- `load_obj(path)` — 读取 OBJ 文件
-- `generate_square_cloth(nrows, ncols, size)` — 程序化生成规则网格
-- `build_inner_edges()` — 构建内边表（边→两个三角形映射）
-- `precompute_rest_state()` — 计算 Dm_inv、rest_area、mass
-- `precompute_bending_state()` — 计算 rest_angles、edge_lengths
-- `upload_to_gpu()` — 数据传送到 GPU
-
-### 3.2 Constraints 模块
+### 3.2 Constraints 模块 (已存在)
 
 ```cpp
 // include/constraints.h
 
 struct Constraints {
-    std::vector<int> pinned_indices;    // 固定顶点索引
-    std::vector<float> target_pos;      // 目标位置 [N×3]
+    std::vector<int> pinned_indices;
 
-    // 预设边界条件
-    void pin_one_side(const ClothMesh& mesh, int ncols);      // 固定第一行
-    void pin_corners(const ClothMesh& mesh, int ncols);       // 固定对角
-    void pin_top_row(const ClothMesh& mesh, int ncols);       // 固定顶行
-    void set_from_list(const std::vector<int>& indices);
+    void pin_top_row(const ClothMesh& mesh, int ncols);
+    void pin_corners(const ClothMesh& mesh, int nrows, int ncols);
 
-    // GPU 应用
-    void upload_to_gpu();
-    void apply_gpu(float* d_pos, float* d_vel, float* d_force);
+    // GPU
+    int* d_pinned_indices;
+    int num_pinned;
+
+    void apply_gpu(float* d_pos, float* d_vel);  // 固定点设为 rest_pos
 };
 ```
 
-### 3.3 Material 模块
+### 3.3 PD Solver 模块 (核心)
 
 ```cpp
-// include/material.h
+// include/pd_solver.h
 
-enum class MaterialModel { StVK, NeoHookean };
-
-struct MaterialParams {
-    MaterialModel model = MaterialModel::StVK;
-    float young_modulus = 1e5f;
-    float poisson_ratio = 0.3f;
-    float density       = 0.1f;
-    float damping_alpha = 0.01f;
-    float damping_beta  = 0.001f;
-
-    float lambda() const;
-    float mu() const;
+struct PDSolverConfig {
+    int max_iterations = 50;      // 每帧最大迭代数
+    float tolerance = 1e-4f;      // 收敛阈值
+    bool use_chebyshev = true;    // 是否启用 Chebyshev 加速
+    float omega = 1.0f;           // Jacobi 松弛因子 (Chebyshev 动态调整)
+    float gravity = -9.8f;
+    float dt = 0.01f;             // 时间步长
 };
 
-struct BendingParams {
-    float stiffness = 1e-3f;
-};
-```
-
-### 3.4 FEM Engine 模块
-
-```cuda
-// 弹性力计算（显式）
-__global__ void compute_elastic_forces(
-    const float* __restrict__ pos,
-    const int*   __restrict__ tris,
-    const float* __restrict__ Dm_inv,
-    const float* __restrict__ rest_area,
-    float*       forces,
-    int num_tris,
-    MaterialParams params
-);
-
-// 刚体运动零力验证辅助函数
-__device__ float3 compute_stvk_force(...);
-```
-
-### 3.5 Bending 模块
-
-```cuda
-__global__ void compute_bending_forces(
-    const float* __restrict__ pos,
-    const int*   __restrict__ inner_edges,
-    const float* __restrict__ rest_angles,
-    const float* __restrict__ edge_lengths,
-    float*       forces,
-    int num_inner_edges,
-    BendingParams params
-);
-```
-
-### 3.6 Integrator 模块
-
-```cpp
-// include/integrator.h
-
-class Integrator {
+class PDSolver {
 public:
-    virtual void step(ClothMesh& mesh, const Constraints& cons, float dt) = 0;
-    virtual ~Integrator() = default;
-};
+    PDSolver(const PDSolverConfig& config);
+    ~PDSolver();
 
-class ExplicitVerlet : public Integrator {
-public:
-    void step(ClothMesh& mesh, const Constraints& cons, float dt) override;
+    // 主入口: 执行一帧 PD 迭代
+    void step(ClothMesh& mesh, const Constraints& cons);
+
 private:
-    // 工作缓冲区
-    float* d_force;
-};
+    PDSolverConfig config_;
 
-class ImplicitEuler : public Integrator {
-    // ... PCG 求解器
-};
-```
+    // CUDA kernels
+    void predict_positions(ClothMesh& mesh);           // y = x + h*v + h²*f_ext/m
+    void local_step_stretch(const ClothMesh& mesh);    // 计算边投影
+    void local_step_bend(const ClothMesh& mesh);       // 计算弯曲投影
+    void global_step_jacobi(const ClothMesh& mesh);    // Jacobi 迭代
+    void update_velocity_and_positions(ClothMesh& mesh); // v = (x_new - x)/h
 
-#### 显式 Verlet 流程
+    // Chebyshev 加速
+    float omega_prev_ = 1.0f;
+    float omega_curr_ = 1.0f;
+    void chebyshev_update(float* d_pos, float* d_prev_pos, int num_verts);
+    void reset_chebyshev();
 
-```
-1. kernel: clear_forces
-2. kernel: compute_elastic_forces
-3. kernel: compute_bending_forces
-4. kernel: add_gravity
-5. kernel: apply_damping
-6. kernel: integrate_verlet
-7. kernel: apply_constraints
-```
-
-### 3.7 Viewer 模块（OpenGL）
-
-```cpp
-// include/viewer.h
-
-class ClothViewer {
-public:
-    bool init(int width, int height, int num_verts, int num_tris);
-    void update_positions(const float* d_pos);  // CUDA device pointer
-    void draw(const ClothMesh& mesh);
-    void poll_events();
-    bool should_close() const;
-    void cleanup();
-
-    // GUI 状态（绑定到 ImGui）
-    float gui_dt = 1e-3f;
-    float gui_young_modulus = 1e5f;
-    bool  gui_running = true;
-    bool  gui_step = false;
+    // 临时 GPU 缓冲区
+    float* d_projections_;      // Local step 结果 [总约束数×3]
+    float* d_rhs_;              // Global step 右端项 [N×3]
 };
 ```
 
+### 3.4 CUDA Kernels 设计
+
+```cuda
+// src/pd_solver.cu
+
+// === Local Step Kernels ===
+
+// 每线程处理一条拉伸约束
+__global__ void stretch_projection_kernel(
+    const float* __restrict__ pos,
+    const int2* __restrict__ edges,
+    const float* __restrict__ rest_lengths,
+    const float* __restrict__ stiffness,
+    float3* __restrict__ projections,  // 输出: 两个投影点
+    int num_edges
+);
+
+// 每线程处理一条弯曲约束
+__global__ void bend_projection_kernel(
+    const float* __restrict__ pos,
+    const int4* __restrict__ quads,    // (v0, v1, v2, v3)
+    const float* __restrict__ rest_angles,
+    const float* __restrict__ stiffness,
+    float3* __restrict__ projections,  // 输出: 4个投影点
+    int num_bends
+);
+
+// === Global Step Kernel ===
+
+// Jacobi 迭代: 每个顶点一个线程
+__global__ void jacobi_update_kernel(
+    const float* __restrict__ pos,      // 当前位置
+    const float* __restrict__ predict,  // y (惯性预测)
+    const float* __restrict__ mass,     // 质量
+    const float* __restrict__ jacobi_diag, // 预计算的 (M + h²L)_ii
+
+    // 拉伸约束贡献
+    const int2* __restrict__ stretch_edges,
+    const float3* __restrict__ stretch_proj,
+    const float* __restrict__ stretch_k,
+
+    // 弯曲约束贡献
+    const int4* __restrict__ bend_quads,
+    const float3* __restrict__ bend_proj,
+    const float* __restrict__ bend_k,
+
+    float* __restrict__ new_pos,        // 输出
+    int num_verts,
+    float dt
+);
+
+// === Constraint Application ===
+
+__global__ void apply_pinned_constraints_kernel(
+    float* __restrict__ pos,
+    float* __restrict__ vel,
+    const int* __restrict__ pinned_indices,
+    const float* __restrict__ rest_pos,
+    int num_pinned
+);
+```
+
 ---
 
-## 四、实现路线图与检查点
+## 四、实现路线图 (更新版)
 
-### Phase 1: 基础框架 ✓ (已完成)
+### Phase 1-2.5: 已完成
+- [x] 基础框架、网格生成、静态可视化
+
+### Phase 3: PD 核心求解器
+
+**新增文件**:
+- `include/pd_solver.h`, `src/pd_solver.cu`
 
 **交付物**:
-- [x] 分层 CMakeLists.txt（CUDA 自动探测，CPU-only 降级）
-- [x] ClothMesh 数据结构（CPU Eigen + GPU 指针）
-- [x] OBJ 加载器
-- [x] Dm_inv、面积、质量预计算
-- [x] GPU 数据上传
+- [ ] `build_stretch_constraints()` — 从三角形生成边约束
+- [ ] `build_bend_constraints()` — 从内边生成弯曲约束
+- [ ] `precompute_jacobi_diagonal()` — 预计算 Jacobi 分母
+- [ ] `stretch_projection_kernel` — 边约束投影
+- [ ] `jacobi_update_kernel` — 基础 Jacobi 迭代
+- [ ] `predict_positions` / `update_velocity` — 时间积分
+- [ ] 纯命令行仿真工具 `sim_cloth` (无渲染，验证正确性)
 
 **验证检查点**:
 ```bash
-./cuda_ms
-# 输出: Mass verification PASS
-# 输出: Dm_inv identity check PASS
+# 检查点 3.1: 单根弹簧振荡 (解析解对比)
+./sim_cloth --test-spring --steps 1000
+# 输出: 周期/振幅与理论值误差 < 1%
+
+# 检查点 3.2: 固定点约束
+./sim_cloth --test-pinned --steps 100
+# 输出: 固定点位置不变，其余点运动合理
+
+# 检查点 3.3: 能量衰减 (有阻尼)
+./sim_cloth --test-damping --steps 500
+# 输出: 总能量单调递减
 ```
 
 ---
 
-### Phase 2: 网格生成与拓扑
-
-**新增文件**:
-- `include/mesh_generator.h`, `src/mesh_generator.cpp`
-- `include/constraints.h`, `src/constraints.cpp`
-- `src/mesh.cpp` 扩展 `build_inner_edges()`
+### Phase 4: 弯曲约束 + Chebyshev 加速
 
 **交付物**:
-- [ ] `generate_square_cloth(nrows, ncols, size, type)` — 规则网格生成
-  - type 0: 统一对角线方向
-  - type 1: 交替对角线（棋盘式）
-- [ ] `build_inner_edges()` — 内边拓扑构建
-- [ ] `Constraints` 类 — 固定约束管理
-  - [ ] `pin_one_side()`, `pin_corners()`, `pin_top_row()`
-
-**验证检查点**:
-```bash
-# 检查点 2.1
-./cuda_ms --gen-cloth 10 10 0.1
-# 输出: 100 vertices, 162 triangles
-# 输出: Inner edges: 81, Boundary edges: 38
-
-# 检查点 2.2
-./cuda_ms --test-constraints pin_top_row
-# 输出: 10 vertices pinned
-```
-
----
-
-### Phase 2.5: 静态网格可视化 (GLFW + GLAD + ImGui)
-
-**目标**：在仿真逻辑完成之前，先把渲染管线搭好。此阶段只渲染静态网格，不涉及 CUDA interop，保持实现最简。
-
-**新增文件**:
-- `include/viewer.h`, `src/viewer.cpp` — `ClothViewer` 类
-- `shaders/flat.vs`, `shaders/flat.fs` — 平面着色器（带线框叠加）
-- `src/tools/view_cloth.cpp` — 独立可执行文件
-
-**交付物**:
-- [ ] `ClothViewer` 类
-  - [ ] GLFW 窗口 + GLAD OpenGL 加载
-  - [ ] 一次性 CPU→VBO 上传（`upload_mesh`）
-  - [ ] Flat shading（面法线，无需预计算顶点法线）
-  - [ ] 线框叠加（`GL_LINES`，可切换）
-  - [ ] Arcball 轨道相机（鼠标拖动旋转，滚轮缩放）
-- [ ] Dear ImGui 面板
-  - [ ] 网格统计（顶点数、三角形数、内边数）
-  - [ ] 线框开关、背面剔除开关
-  - [ ] 网格颜色滑块
-- [ ] CMake：新增 `view_cloth` target，依赖 `cuda_ms_core` + GLFW + ImGui
-
-**接口设计**（最简）:
-```cpp
-// include/viewer.h
-class ClothViewer {
-public:
-    bool init(int width = 1280, int height = 720, const char* title = "cuda-ms");
-    void upload_mesh(const ClothMesh& mesh);   // CPU → VBO，调用一次
-    bool should_close() const;
-    void begin_frame();                         // poll events + ImGui new frame
-    void render(const ClothMesh& mesh);         // draw call
-    void end_frame();                           // swap buffers
-    void cleanup();
-};
-```
-
-**用法**:
-```bash
-view_cloth <nrows> <ncols> <size> [type]
-# 示例：view_cloth 20 20 0.05 1
-```
-
-**验证检查点**:
-```bash
-# 检查点 2.5.1: 静态网格显示
-./src/view_cloth 20 20 0.05 0
-# 应弹出窗口，显示布料网格，可拖动旋转
-
-# 检查点 2.5.2: 线框切换
-# 在 ImGui 面板勾选 Wireframe，网格边可见
-
-# 检查点 2.5.3: ImGui 面板数据正确
-# 面板显示 Vertices: 400, Triangles: 722, Inner edges: 1521
-```
-
-**依赖**:
-
-| 库 | 获取方式 |
-|----|---------|
-| GLFW 3 | `apt install libglfw3-dev` 或 FetchContent |
-| GLAD (OpenGL 4.1 Core) | 预生成源文件放 `src/utils/glad/` |
-| Dear ImGui | FetchContent 或 submodule，后端 `imgui_impl_glfw` + `imgui_impl_opengl3` |
-
----
-
-### Phase 3: 显式积分器 + 膜力 (StVK)
-
-**新增文件**:
-- `include/fem_engine.h`, `src/fem_engine.cu`
-- `include/integrator.h`, `src/integrator.cu`
-- `include/simulation.h`, `src/simulation.cpp`
-
-**交付物**:
-- [ ] `compute_stvk_forces_kernel` — 每线程一个三角形
-- [ ] `verlet_integrate_kernel` — 时间积分
-- [ ] `apply_constraints_kernel` — 约束应用
-- [ ] `ExplicitVerlet` 类 — 完整显式积分器
-- [ ] `Simulation` 类 — 顶层管理
-
-**验证检查点**:
-```bash
-# 检查点 3.1: 单三角形拉伸（解析解对比）
-./cuda_ms --test-stretch-single-tri
-# 输出: Force error < 1%
-
-# 检查点 3.2: 刚体运动零力
-./cuda_ms --test-rigid-motion
-# 输出: Max force < 1e-6
-
-# 检查点 3.3: 自由落体
-./cuda_ms --free-fall 100
-# y(t) 与 y0 - 0.5*g*t^2 对比，误差 < 0.1%
-
-# 检查点 3.4: 悬挂布料（无弯曲）
-./cuda_ms --hang-membrane --steps 2000
-# 输出: 能量收敛，形状合理
-```
-
----
-
-### Phase 4: 弯曲力 (Discrete Hinge)
-
-**新增文件**:
-- `include/bending.h`, `src/bending.cu`
-
-**交付物**:
-- [ ] `compute_bending_forces_kernel` — 每线程一条内边
-  - [ ] 二面角计算（atan2 方式，arborecence 风格）
-  - [ ] 能量梯度 ∂E/∂x
-  - [ ] 4 顶点原子累加
-- [ ] `precompute_bending_state()` — 参考二面角预计算
+- [ ] `bend_projection_kernel` — 二面角约束投影
+- [ ] `chebyshev_update` — Chebyshev 加速迭代
+- [ ] 对比实验: Jacobi vs Chebyshev 收敛速度
 
 **验证检查点**:
 ```bash
 # 检查点 4.1: 纯弯曲测试
-./cuda_ms --test-pure-bend
-# 输出: 弯矩-曲率关系符合理论
+./sim_cloth --test-bend-plate --steps 200
+# 输出: 板弯曲形状合理
 
-# 检查点 4.2: 悬挂布料（膜+弯曲）
-./cuda_ms --hang-cloth --steps 2000
-# 输出: 与 arborecence 结果对比，位移误差 < 5%
+# 检查点 4.2: Chebyshev 加速效果
+./sim_cloth --bench --iterations 100
+# 输出: Chebyshev 达到相同精度所需迭代次数 < 50% Jacobi
 
-# 检查点 4.3: 能量守恒（无阻尼）
-./cuda_ms --energy-conservation --steps 1000
-# 输出: |E(t) - E(0)| / E(0) < 1e-4
+# 检查点 4.3: 悬挂布料
+./sim_cloth --hang 20 20 --steps 1000
+# 输出: 布料下垂形成自然悬链线形状
 ```
 
 ---
 
-### Phase 5: 实时仿真渲染 (CUDA Interop)
+### Phase 5: CUDA Interop + 实时渲染
 
-> 渲染管线已在 Phase 2.5 搭好，本阶段只需接入仿真循环与 CUDA interop。
-
-**新增/修改文件**:
-- `src/viewer.cpp` — 扩展 `upload_mesh` 为 CUDA interop 路径
-- `shaders/phong.vs`, `shaders/phong.fs` — 升级为 Phong 光照（替换 flat shader）
-- `src/main.cpp` — 接入 `Simulation` + `ClothViewer` 主循环
+**修改文件**:
+- `src/viewer/viewer.cpp` — 添加 `update_from_cuda()` 接口
+- `src/main.cpp` — 接入 PD 求解器
 
 **交付物**:
-- [ ] `cudaGraphicsGLRegisterBuffer` — GPU 直写 VBO，零 CPU 拷贝
-- [ ] `ClothViewer::update_positions(float* d_pos)` — 每帧从 device pointer 更新顶点
-- [ ] Phong 光照（逐顶点法线，每帧重新计算）
-- [ ] ImGui 参数面板接入仿真：dt、Young's modulus、重力、暂停/单步
-- [ ] 实时主循环（`begin_frame → sim.step → update_positions → render → end_frame`）
+- [ ] `cudaGraphicsGLRegisterBuffer` 零拷贝 VBO 更新
+- [ ] `ClothViewer::update_from_device(float* d_pos)`
+- [ ] ImGui 面板: dt、迭代次数、刚度、重力调节
+- [ ] 实时主循环
 
 **验证检查点**:
 ```bash
-# 检查点 5.1: 实时仿真渲染
-./cuda_ms --cloth 20 20 --hang
-# 应显示布料从静止开始下垂，实时渲染，>30 FPS
+# 检查点 5.1: 实时仿真
+./cuda_ms --cloth 30 30 --hang
+# 输出: >30 FPS，布料自然下垂
 
-# 检查点 5.2: ImGui 调参
-# 拖动 Young's modulus 滑块，布料刚度实时变化
+# 检查点 5.2: 参数调节
+# ImGui 调节 Young's modulus，布料刚度实时变化
 
-# 检查点 5.3: 帧导出
-./cuda_ms --cloth 20 20 --hang --save-frames ./frames/ --steps 200
-# 生成 frames/frame_*.ply，可用 MeshLab 检查
+# 检查点 5.3: 导出序列帧
+./cuda_ms --cloth 50 50 --hang --export ./frames/ --steps 300
 ```
 
 ---
 
-### Phase 6: 隐式积分（可选/进阶）
+### Phase 6: 性能优化 (可选)
 
-**新增文件**:
-- `include/sparse_matrix.h`, `src/sparse_matrix.cu`
-- `include/linear_solver.h`, `src/linear_solver.cu`
-- `include/implicit_integrator.h`, `src/implicit_integrator.cu`
+**优化方向**:
+- [ ] Warp-level 并行优化 (减少 divergence)
+- [ ] 共享内存缓存邻接顶点数据
+- [ ] A-Jacobi (论文 2022 方法)
+- [ ] 多网格/层次化方法
 
-**交付物**:
-- [ ] CSR 稀疏矩阵构建
-- [ ] 刚度矩阵 kernel
-- [ ] PCG 求解器（cuSPARSE + Jacobi 预条件）
-- [ ] `ImplicitEuler` 类
+---
 
-**验证检查点**:
-```bash
-# 检查点 6.1: 大时间步稳定性
-./cuda_ms --implicit --dt 0.01 --steps 100
-# 显式此时应发散，隐式应稳定
+## 五、关键算法细节
 
-# 检查点 6.2: 与显式对比
-./cuda_ms --compare --dt 0.001 --steps 1000
-# 隐式/显式结果应接近
+### 5.1 Jacobi 迭代公式
+
+对每个顶点 `i`:
+```
+x_i^{new} = (m_i·y_i + h² · Σ_{c∈C_i} w_c · A_c^T p_c) / (m_i + h² · Σ_{c∈C_i} w_c · A_c^T A_c)
+```
+
+分母 `diag_i = m_i + h² · Σ w_c` 是常数，预计算存储。
+
+### 5.2 Chebyshev 加速
+
+```
+ω_1 = 1
+ω_2 = 2/(2 - ρ²)  (ρ 是 Jacobi 迭代矩阵谱半径，通常取 0.9~0.99)
+
+k ≥ 2 时:
+ω_{k+1} = 4/(4 - ρ²·ω_k)
+
+更新公式:
+x^{k+1} = ω_{k+1} · (Jacobi_update(x^k) - x^{k-1}) + x^{k-1}
+```
+
+### 5.3 拉伸约束投影
+
+对边约束 `|x_j - x_i| = L_rest`:
+```
+center = (x_i + x_j) / 2
+dir = (x_j - x_i) / |x_j - x_i|
+p_i = center - (L_rest/2) · dir
+p_j = center + (L_rest/2) · dir
+```
+
+### 5.4 弯曲约束投影 (简化版)
+
+对二面角约束，使用 Grinspun et al. 的离散壳模型:
+```
+1. 计算当前二面角 θ
+2. 计算法向 n1, n2
+3. 梯度方向 ∂θ/∂x (4个顶点的权重)
+4. 投影: 沿梯度方向旋转顶点使 θ = θ_rest
 ```
 
 ---
 
-## 五、验证方案汇总
+## 六、验证方案
 
 | 阶段 | 检查命令 | 通过标准 |
 |------|----------|----------|
-| 1 | `./cuda_ms` | Mass/Dm_inv PASS |
-| 2 | `./src/gen_cloth 10 10 0.1` | 顶点/三角形/内边数正确；test_* 全 0 failed |
-| 2.5 | `./src/view_cloth 20 20 0.05` | 弹出窗口，可旋转，ImGui 面板正常 |
-| 3 | `--test-stretch-single-tri` | 力误差 < 1% |
-| 3 | `--free-fall 100` | 位移匹配 y = 0.5*g*t^2 |
-| 4 | `--hang-cloth` | 与参考解对比 |
-| 5 | `--cloth 20 20 --hang` | 实时渲染 >30 FPS，ImGui 调参生效 |
-| 6 | `--implicit --dt 0.01` | 大时间步稳定 |
+| 3 | `--test-spring` | 周期/振幅误差 < 1% |
+| 3 | `--test-pinned` | 固定点不动 |
+| 4 | `--test-bend-plate` | 弯曲形状合理 |
+| 4 | `--bench` | Chebyshev 加速比 > 1.5x |
+| 4 | `--hang` | 悬链线与参考解对比 |
+| 5 | `--cloth 30 30` | >30 FPS |
 
 ---
 
-## 六、依赖库
+## 七、与原版 FEM 设计的区别
 
-| 库 | 用途 | 引入阶段 |
-|----|------|----------|
-| CUDA Toolkit | GPU 计算 | Phase 1 |
-| Eigen 3 | CPU 预处理 | Phase 1 |
-| GLFW 3 | 窗口/输入 | Phase 2.5 |
-| GLAD (OpenGL 4.1 Core) | OpenGL 函数加载 | Phase 2.5 |
-| Dear ImGui | GUI 参数面板 | Phase 2.5 |
-| cuSPARSE | 稀疏矩阵（隐式积分） | Phase 6 |
+| 方面 | FEM 原版 | PD 新版 |
+|------|----------|---------|
+| 核心算法 | 显式/隐式 Newton 迭代 | Local-Global 交替迭代 |
+| 线性求解 | 每帧构建/求解 K·Δx = f | 固定矩阵，Jacobi 迭代 |
+| 拉伸模型 | StVK/Neo-Hookean 本构 | 边长度约束投影 |
+| 弯曲模型 | 二面角能量梯度 | 二面角约束投影 |
+| GPU 友好度 | 中 (稀疏矩阵) | 高 (完全并行) |
+| 收敛性 | 条件稳定/无条件稳定 | 无条件稳定 |
+| 实现复杂度 | 高 | 中 |
 
 ---
 
-*文档 v0.2：整合 ROADMAP，添加详细检查点*
+## 八、依赖库
+
+| 库 | 用途 | 状态 |
+|----|------|------|
+| CUDA Toolkit | GPU 计算 | 已有 |
+| Eigen 3 | CPU 预处理 | 已有 |
+| GLFW + GLAD + ImGui | 可视化 | Phase 2.5 已完成 |
+
+**无需**: cuSPARSE (PD 不需要稀疏矩阵求解器)
+
+---
+
+*文档 v0.3: 重构为 Projective Dynamics 方案*
