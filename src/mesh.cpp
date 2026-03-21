@@ -6,6 +6,8 @@
 #include <cstdio>
 #include <cmath>
 #include <algorithm>
+#include <unordered_map>
+#include <utility>
 
 #ifdef CUDA_MS_HAVE_CUDA
 #  include <cuda_runtime.h>
@@ -20,12 +22,13 @@ ClothMesh::~ClothMesh() {
 void ClothMesh::free_gpu() {
 #ifdef CUDA_MS_HAVE_CUDA
     auto safe_free = [](void* p) { if (p) cudaFree(p); };
-    safe_free(d_pos);       d_pos       = nullptr;
-    safe_free(d_vel);       d_vel       = nullptr;
-    safe_free(d_tris);      d_tris      = nullptr;
-    safe_free(d_Dm_inv);    d_Dm_inv    = nullptr;
-    safe_free(d_rest_area); d_rest_area = nullptr;
-    safe_free(d_mass);      d_mass      = nullptr;
+    safe_free(d_pos);         d_pos         = nullptr;
+    safe_free(d_vel);         d_vel         = nullptr;
+    safe_free(d_tris);        d_tris        = nullptr;
+    safe_free(d_Dm_inv);      d_Dm_inv      = nullptr;
+    safe_free(d_rest_area);   d_rest_area   = nullptr;
+    safe_free(d_mass);        d_mass        = nullptr;
+    safe_free(d_inner_edges); d_inner_edges = nullptr;
 #endif
 }
 
@@ -117,6 +120,65 @@ void ClothMesh::precompute_rest_state(float density) {
     }
 }
 
+// ---- Inner-edge topology ----
+
+void ClothMesh::build_inner_edges() {
+    // Hash for std::pair<int,int>
+    struct EdgeHash {
+        size_t operator()(const std::pair<int, int>& e) const {
+            return std::hash<long long>()(
+                (static_cast<long long>(e.first) << 32) | static_cast<unsigned>(e.second));
+        }
+    };
+
+    // Map: canonical edge (a < b) -> {tri_a_idx, opposite_vertex_a, tri_b_idx, opposite_vertex_b}
+    // tri_b_idx == -1 until a second triangle is found.
+    struct EdgeRecord {
+        int tri_a      = -1;
+        int opp_a      = -1;
+        int tri_b      = -1;
+        int opp_b      = -1;
+    };
+    std::unordered_map<std::pair<int,int>, EdgeRecord, EdgeHash> edge_map;
+    edge_map.reserve(num_tris * 3);
+
+    auto add_edge = [&](int va, int vb, int tri_idx, int opp_vertex) {
+        // Canonicalise so that first < second
+        if (va > vb) std::swap(va, vb);
+        auto key = std::make_pair(va, vb);
+        auto it = edge_map.find(key);
+        if (it == edge_map.end()) {
+            EdgeRecord rec;
+            rec.tri_a = tri_idx;
+            rec.opp_a = opp_vertex;
+            edge_map[key] = rec;
+        } else {
+            it->second.tri_b = tri_idx;
+            it->second.opp_b = opp_vertex;
+        }
+    };
+
+    for (int t = 0; t < num_tris; ++t) {
+        int v0 = triangles[t](0);
+        int v1 = triangles[t](1);
+        int v2 = triangles[t](2);
+        add_edge(v0, v1, t, v2);
+        add_edge(v1, v2, t, v0);
+        add_edge(v0, v2, t, v1);
+    }
+
+    inner_edges.clear();
+    for (auto& kv : edge_map) {
+        const EdgeRecord& rec = kv.second;
+        if (rec.tri_b == -1) continue; // boundary edge
+
+        // v0, v1 = shared edge; v2 = opposite in tri_a; v3 = opposite in tri_b
+        inner_edges.emplace_back(kv.first.first, kv.first.second,
+                                 rec.opp_a, rec.opp_b);
+    }
+    num_inner_edges = static_cast<int>(inner_edges.size());
+}
+
 // ---- GPU upload ----
 
 void ClothMesh::upload_to_gpu() {
@@ -161,6 +223,18 @@ void ClothMesh::upload_to_gpu() {
     alloc_and_copy((void**)&d_rest_area, rest_area.data(), T     * sizeof(float));
     alloc_and_copy((void**)&d_mass,      mass.data(),      N     * sizeof(float));
 
+    if (num_inner_edges > 0) {
+        std::vector<int> h_ie(num_inner_edges * 4);
+        for (int e = 0; e < num_inner_edges; ++e) {
+            h_ie[e * 4 + 0] = inner_edges[e](0);
+            h_ie[e * 4 + 1] = inner_edges[e](1);
+            h_ie[e * 4 + 2] = inner_edges[e](2);
+            h_ie[e * 4 + 3] = inner_edges[e](3);
+        }
+        alloc_and_copy((void**)&d_inner_edges, h_ie.data(),
+                       num_inner_edges * 4 * sizeof(int));
+    }
+
     cudaMalloc((void**)&d_vel, N * 3 * sizeof(float));
     cudaMemset(d_vel, 0, N * 3 * sizeof(float));
 #else
@@ -195,5 +269,6 @@ void ClothMesh::print_stats() const {
                Dm_inv[t](1,0), Dm_inv[t](1,1));
     }
 
+    printf("  Inner edges: %d\n", num_inner_edges);
     printf("  GPU buffers: %s\n", (d_pos != nullptr) ? "allocated" : "not allocated");
 }
