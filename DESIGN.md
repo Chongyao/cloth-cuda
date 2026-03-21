@@ -392,6 +392,72 @@ public:
 
 ---
 
+### Phase 2.5: 静态网格可视化 (GLFW + GLAD + ImGui)
+
+**目标**：在仿真逻辑完成之前，先把渲染管线搭好。此阶段只渲染静态网格，不涉及 CUDA interop，保持实现最简。
+
+**新增文件**:
+- `include/viewer.h`, `src/viewer.cpp` — `ClothViewer` 类
+- `shaders/flat.vs`, `shaders/flat.fs` — 平面着色器（带线框叠加）
+- `src/tools/view_cloth.cpp` — 独立可执行文件
+
+**交付物**:
+- [ ] `ClothViewer` 类
+  - [ ] GLFW 窗口 + GLAD OpenGL 加载
+  - [ ] 一次性 CPU→VBO 上传（`upload_mesh`）
+  - [ ] Flat shading（面法线，无需预计算顶点法线）
+  - [ ] 线框叠加（`GL_LINES`，可切换）
+  - [ ] Arcball 轨道相机（鼠标拖动旋转，滚轮缩放）
+- [ ] Dear ImGui 面板
+  - [ ] 网格统计（顶点数、三角形数、内边数）
+  - [ ] 线框开关、背面剔除开关
+  - [ ] 网格颜色滑块
+- [ ] CMake：新增 `view_cloth` target，依赖 `cuda_ms_core` + GLFW + ImGui
+
+**接口设计**（最简）:
+```cpp
+// include/viewer.h
+class ClothViewer {
+public:
+    bool init(int width = 1280, int height = 720, const char* title = "cuda-ms");
+    void upload_mesh(const ClothMesh& mesh);   // CPU → VBO，调用一次
+    bool should_close() const;
+    void begin_frame();                         // poll events + ImGui new frame
+    void render(const ClothMesh& mesh);         // draw call
+    void end_frame();                           // swap buffers
+    void cleanup();
+};
+```
+
+**用法**:
+```bash
+view_cloth <nrows> <ncols> <size> [type]
+# 示例：view_cloth 20 20 0.05 1
+```
+
+**验证检查点**:
+```bash
+# 检查点 2.5.1: 静态网格显示
+./src/view_cloth 20 20 0.05 0
+# 应弹出窗口，显示布料网格，可拖动旋转
+
+# 检查点 2.5.2: 线框切换
+# 在 ImGui 面板勾选 Wireframe，网格边可见
+
+# 检查点 2.5.3: ImGui 面板数据正确
+# 面板显示 Vertices: 400, Triangles: 722, Inner edges: 1521
+```
+
+**依赖**:
+
+| 库 | 获取方式 |
+|----|---------|
+| GLFW 3 | `apt install libglfw3-dev` 或 FetchContent |
+| GLAD (OpenGL 4.1 Core) | 预生成源文件放 `src/utils/glad/` |
+| Dear ImGui | FetchContent 或 submodule，后端 `imgui_impl_glfw` + `imgui_impl_opengl3` |
+
+---
+
 ### Phase 3: 显式积分器 + 膜力 (StVK)
 
 **新增文件**:
@@ -456,34 +522,34 @@ public:
 
 ---
 
-### Phase 5: 实时可视化 (OpenGL)
+### Phase 5: 实时仿真渲染 (CUDA Interop)
 
-**新增文件**:
-- `include/viewer.h`, `src/viewer.cpp`
-- `shaders/phong.vs`, `shaders/phong.fs`
-- `src/main_viz.cpp`
+> 渲染管线已在 Phase 2.5 搭好，本阶段只需接入仿真循环与 CUDA interop。
+
+**新增/修改文件**:
+- `src/viewer.cpp` — 扩展 `upload_mesh` 为 CUDA interop 路径
+- `shaders/phong.vs`, `shaders/phong.fs` — 升级为 Phong 光照（替换 flat shader）
+- `src/main.cpp` — 接入 `Simulation` + `ClothViewer` 主循环
 
 **交付物**:
-- [ ] `ClothViewer` 类 — GLFW + GLAD 初始化
-- [ ] `cudaGraphicsGLRegisterBuffer` 零拷贝
-- [ ] Phong 光照渲染
-- [ ] 实时仿真循环
-- [ ] 键盘/鼠标控制（旋转、缩放）
-- [ ] 可选：ImGui 参数面板
+- [ ] `cudaGraphicsGLRegisterBuffer` — GPU 直写 VBO，零 CPU 拷贝
+- [ ] `ClothViewer::update_positions(float* d_pos)` — 每帧从 device pointer 更新顶点
+- [ ] Phong 光照（逐顶点法线，每帧重新计算）
+- [ ] ImGui 参数面板接入仿真：dt、Young's modulus、重力、暂停/单步
+- [ ] 实时主循环（`begin_frame → sim.step → update_positions → render → end_frame`）
 
 **验证检查点**:
 ```bash
-# 检查点 5.1: 静态网格显示
-./cuda_ms_viz --mesh test.obj
-# 应显示窗口，可旋转视角
+# 检查点 5.1: 实时仿真渲染
+./cuda_ms --cloth 20 20 --hang
+# 应显示布料从静止开始下垂，实时渲染，>30 FPS
 
-# 检查点 5.2: 实时仿真
-./cuda_ms_viz --sim --cloth 20 20
-# 应显示布料实时下落变形，>30 FPS
+# 检查点 5.2: ImGui 调参
+# 拖动 Young's modulus 滑块，布料刚度实时变化
 
-# 检查点 5.3: 帧输出
-./cuda_ms --offline --save-frames ./frames/ --steps 100
-# 生成 frames/frame_*.ply
+# 检查点 5.3: 帧导出
+./cuda_ms --cloth 20 20 --hang --save-frames ./frames/ --steps 200
+# 生成 frames/frame_*.ply，可用 MeshLab 检查
 ```
 
 ---
@@ -519,25 +585,26 @@ public:
 | 阶段 | 检查命令 | 通过标准 |
 |------|----------|----------|
 | 1 | `./cuda_ms` | Mass/Dm_inv PASS |
-| 2 | `--gen-cloth 10 10` | 顶点/三角形/内边数正确 |
+| 2 | `./src/gen_cloth 10 10 0.1` | 顶点/三角形/内边数正确；test_* 全 0 failed |
+| 2.5 | `./src/view_cloth 20 20 0.05` | 弹出窗口，可旋转，ImGui 面板正常 |
 | 3 | `--test-stretch-single-tri` | 力误差 < 1% |
 | 3 | `--free-fall 100` | 位移匹配 y = 0.5*g*t^2 |
 | 4 | `--hang-cloth` | 与参考解对比 |
-| 5 | `--viz --sim` | 实时 >30 FPS |
+| 5 | `--cloth 20 20 --hang` | 实时渲染 >30 FPS，ImGui 调参生效 |
 | 6 | `--implicit --dt 0.01` | 大时间步稳定 |
 
 ---
 
 ## 六、依赖库
 
-| 库 | 用途 | 是否必须 |
+| 库 | 用途 | 引入阶段 |
 |----|------|----------|
-| CUDA Toolkit | GPU 计算 | 必须 |
-| cuSPARSE | 稀疏矩阵（隐式阶段） | Phase 6 |
-| Eigen 3 | CPU 预处理 | 必须 |
-| GLFW | 窗口/输入（可视化） | Phase 5 |
-| GLAD | OpenGL 加载（可视化） | Phase 5 |
-| Dear ImGui | GUI（可选） | Phase 5 |
+| CUDA Toolkit | GPU 计算 | Phase 1 |
+| Eigen 3 | CPU 预处理 | Phase 1 |
+| GLFW 3 | 窗口/输入 | Phase 2.5 |
+| GLAD (OpenGL 4.1 Core) | OpenGL 函数加载 | Phase 2.5 |
+| Dear ImGui | GUI 参数面板 | Phase 2.5 |
+| cuSPARSE | 稀疏矩阵（隐式积分） | Phase 6 |
 
 ---
 
