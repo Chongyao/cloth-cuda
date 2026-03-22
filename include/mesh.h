@@ -52,7 +52,25 @@ struct ClothMesh {
     // ---- CPU precomputed ----
     std::vector<Eigen::Matrix2f> Dm_inv;     // inverse reference edge matrix [T]
 
-    // ---- Inner-edge topology (for bending) ----
+    // ==== Topology Tables ====
+    // Edge topology: each edge stores (v0, v1, tri_a, tri_b)
+    // tri_b = -1 for boundary edges
+    struct EdgeTopo {
+        int v0, v1;      // vertex indices (v0 < v1)
+        int tri_a;       // left triangle
+        int tri_b;       // right triangle (-1 if boundary)
+        float rest_len;  // rest length
+    };
+    std::vector<EdgeTopo> edges;  // all unique edges
+
+    // Vertex to triangles adjacency list
+    std::vector<std::vector<int>> vert_to_tris;
+
+    // Triangle to triangles adjacency (via shared edges)
+    // tri_to_tris[t] = {t0, t1, t2} where t0 shares edge opposite to v0, etc.
+    std::vector<Eigen::Vector3i> tri_to_tris;
+
+    // ---- Inner-edge topology (for bending) - DEPRECATED, use edges instead ----
     std::vector<Eigen::Vector4i> inner_edges;
 
     // ---- Stretch constraints (for PD) ----
@@ -78,9 +96,17 @@ struct ClothMesh {
 #ifndef __CUDACC__
     bool load_obj(const std::string& path);
     void precompute_rest_state(float density = 0.1f);
+
+    // ==== Topology Building ====
+    void build_topology();           // Build edges, vert_to_tris, tri_to_tris
+    void build_stretch_from_topo(float stiffness = 1.0f);  // New: topo-based stretch
+    void build_bend_from_topo(float stiffness = 0.01f);    // New: topo-based bend
+
+    // DEPRECATED: old methods
     void build_inner_edges();
     void build_stretch_constraints(float stiffness = 1.0f);
     void build_bend_constraints(float stiffness = 0.01f);
+
     void precompute_jacobi_diag(float dt, float constraint_wt = 1.0f);
 #endif
     void upload_to_gpu();   // no-op when CUDA not available

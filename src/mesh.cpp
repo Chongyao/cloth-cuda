@@ -187,6 +187,184 @@ void ClothMesh::build_inner_edges() {
     num_inner_edges = static_cast<int>(inner_edges.size());
 }
 
+// ==== New Topology System ====
+
+void ClothMesh::build_topology() {
+    // Clear existing
+    edges.clear();
+    vert_to_tris.clear();
+    tri_to_tris.clear();
+
+    // Resize vertex-to-triangle adjacency
+    vert_to_tris.resize(num_verts);
+    for (int t = 0; t < num_tris; ++t) {
+        vert_to_tris[triangles[t](0)].push_back(t);
+        vert_to_tris[triangles[t](1)].push_back(t);
+        vert_to_tris[triangles[t](2)].push_back(t);
+    }
+
+    // Build edge topology using hash map
+    // Key: (v0, v1) with v0 < v1
+    // Value: (tri_a, tri_b) where tri_b = -1 initially
+    struct EdgeKey {
+        int v0, v1;
+        bool operator==(const EdgeKey& o) const { return v0 == o.v0 && v1 == o.v1; }
+    };
+    struct EdgeKeyHash {
+        size_t operator()(const EdgeKey& e) const {
+            return (static_cast<size_t>(e.v0) << 32) | static_cast<size_t>(e.v1);
+        }
+    };
+
+    std::unordered_map<EdgeKey, std::pair<int, int>, EdgeKeyHash> edge_map;
+    edge_map.reserve(num_tris * 3);
+
+    // For each triangle, add its 3 edges
+    for (int t = 0; t < num_tris; ++t) {
+        int v[3] = {triangles[t](0), triangles[t](1), triangles[t](2)};
+        for (int e = 0; e < 3; ++e) {
+            int a = v[e], b = v[(e+1)%3];
+            if (a > b) std::swap(a, b);
+            EdgeKey key{a, b};
+            auto it = edge_map.find(key);
+            if (it == edge_map.end()) {
+                edge_map[key] = {t, -1};  // First triangle
+            } else {
+                it->second.second = t;    // Second triangle
+            }
+        }
+    }
+
+    // Convert to EdgeTopo array
+    edges.reserve(edge_map.size());
+    for (auto& kv : edge_map) {
+        EdgeTopo et;
+        et.v0 = kv.first.v0;
+        et.v1 = kv.first.v1;
+        et.tri_a = kv.second.first;
+        et.tri_b = kv.second.second;
+        // Compute rest length
+        Eigen::Vector3f p0 = rest_pos[et.v0];
+        Eigen::Vector3f p1 = rest_pos[et.v1];
+        et.rest_len = (p1 - p0).norm();
+        edges.push_back(et);
+    }
+
+    // Build tri_to_tris: for each triangle, find adjacent triangles
+    // tri_to_tris[t][i] = triangle sharing edge opposite to vertex i
+    tri_to_tris.resize(num_tris, Eigen::Vector3i(-1, -1, -1));
+    for (int e = 0; e < edges.size(); ++e) {
+        const EdgeTopo& et = edges[e];
+        if (et.tri_b == -1) continue;  // Boundary edge
+
+        // Find which vertex is opposite to this edge in each triangle
+        auto find_opposite = [&](int tri_idx, int v0, int v1) -> int {
+            for (int i = 0; i < 3; ++i) {
+                int v = triangles[tri_idx](i);
+                if (v != v0 && v != v1) return i;  // Return local vertex index 0,1,2
+            }
+            return -1;
+        };
+
+        int opp_a = find_opposite(et.tri_a, et.v0, et.v1);
+        int opp_b = find_opposite(et.tri_b, et.v0, et.v1);
+
+        if (opp_a != -1) tri_to_tris[et.tri_a][opp_a] = et.tri_b;
+        if (opp_b != -1) tri_to_tris[et.tri_b][opp_b] = et.tri_a;
+    }
+
+    printf("=== Topology Build ===\n");
+    printf("  Vertices: %d\n", num_verts);
+    printf("  Triangles: %d\n", num_tris);
+    printf("  Total edges: %zu\n", edges.size());
+    int boundary_edges = 0, inner_edges_count = 0;
+    for (const auto& e : edges) {
+        if (e.tri_b == -1) boundary_edges++;
+        else inner_edges_count++;
+    }
+    printf("    - Boundary edges: %d\n", boundary_edges);
+    printf("    - Inner edges (bendable): %d\n", inner_edges_count);
+}
+
+void ClothMesh::build_stretch_from_topo(float stiffness) {
+    // Build stretch constraints from edge topology
+    // Each edge becomes a stretch constraint
+    stretch_constraints.clear();
+    stretch_constraints.reserve(edges.size());
+
+    for (const auto& et : edges) {
+        // Store: (v0, v1, rest_len, stiffness)
+        stretch_constraints.emplace_back(et.v0, et.v1, et.rest_len, stiffness);
+    }
+    num_stretch_cons = static_cast<int>(stretch_constraints.size());
+
+    printf("  Stretch constraints from topo: %d\n", num_stretch_cons);
+}
+
+void ClothMesh::build_bend_from_topo(float stiffness) {
+    // Build bend constraints from inner edges (edges with two adjacent triangles)
+    // Each inner edge becomes a bend constraint
+    inner_edges.clear();
+    bend_rest_angles.clear();
+    bend_stiffness.clear();
+
+    for (const auto& et : edges) {
+        if (et.tri_b == -1) continue;  // Skip boundary edges
+
+        // Find opposite vertices in each triangle
+        auto find_opposite = [&](int tri_idx, int v0, int v1) -> int {
+            for (int i = 0; i < 3; ++i) {
+                int v = triangles[tri_idx](i);
+                if (v != v0 && v != v1) return v;
+            }
+            return -1;
+        };
+
+        int v2 = find_opposite(et.tri_a, et.v0, et.v1);
+        int v3 = find_opposite(et.tri_b, et.v0, et.v1);
+
+        if (v2 == -1 || v3 == -1) continue;
+
+        // Compute rest dihedral angle using wing-vector convention
+        Eigen::Vector3f p0 = rest_pos[et.v0];
+        Eigen::Vector3f p1 = rest_pos[et.v1];
+        Eigen::Vector3f p2 = rest_pos[v2];
+        Eigen::Vector3f p3 = rest_pos[v3];
+
+        Eigen::Vector3f edge = p1 - p0;
+        float edge_len = edge.norm();
+        if (edge_len < 1e-10f) continue;
+        Eigen::Vector3f ax = edge / edge_len;
+
+        // Wing vectors
+        auto wing = [&](const Eigen::Vector3f& p) -> Eigen::Vector3f {
+            float t = (p - p0).dot(ax);
+            return (p - p0) - t * ax;
+        };
+
+        Eigen::Vector3f r2 = wing(p2);
+        Eigen::Vector3f r3 = wing(p3);
+        float r2_len = r2.norm(), r3_len = r3.norm();
+
+        if (r2_len < 1e-10f || r3_len < 1e-10f) continue;
+
+        Eigen::Vector3f r2h = r2 / r2_len;
+        Eigen::Vector3f r3h = r3 / r3_len;
+
+        float cos_t = std::clamp(r2h.dot(r3h), -1.0f, 1.0f);
+        float sin_t = r2h.cross(r3h).dot(ax);
+        float rest_angle = std::atan2(sin_t, cos_t);
+
+        inner_edges.emplace_back(et.v0, et.v1, v2, v3);
+        bend_rest_angles.push_back(rest_angle);
+        bend_stiffness.push_back(stiffness);
+    }
+    num_bend_cons = static_cast<int>(inner_edges.size());
+    num_inner_edges = num_bend_cons;
+
+    printf("  Bend constraints from topo: %d\n", num_bend_cons);
+}
+
 // ---- GPU upload ----
 
 void ClothMesh::upload_to_gpu() {
@@ -359,6 +537,7 @@ void ClothMesh::build_stretch_constraints(float stiffness) {
 
     stretch_constraints.clear();
     stretch_constraints.reserve(edge_map.size());
+
     for (const auto& kv : edge_map) {
         const Edge& e = kv.first;
         float rest_len = kv.second;

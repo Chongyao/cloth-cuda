@@ -174,9 +174,13 @@ int main(int argc, char* argv[]) {
     ClothMesh mesh;
     generate_square_cloth(nrows, ncols, size, mesh_type, mesh);
     mesh.precompute_rest_state(0.1f);
-    mesh.build_stretch_constraints(stiffness);
+
+    // Build topology and constraints
+    printf("\n=== Building Topology ===\n");
+    mesh.build_topology();
+    mesh.build_stretch_from_topo(stiffness);
     if (bend_stiffness > 0.0f)
-        mesh.build_bend_constraints(bend_stiffness);
+        mesh.build_bend_from_topo(bend_stiffness);
 
     printf("\nMesh: %d vertices, %d triangles, %d stretch, %d bend constraints\n",
            mesh.num_verts, mesh.num_tris, mesh.num_stretch_cons, mesh.num_bend_cons);
