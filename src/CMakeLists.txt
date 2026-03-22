@@ -100,8 +100,29 @@ target_link_libraries(gen_cloth PRIVATE cuda_ms_core)
 add_executable(view_cloth tools/view_cloth.cpp)
 target_link_libraries(view_cloth PRIVATE viewer)
 
+# ---- PD Solver (CUDA) ----
+if(HAVE_CUDA)
+    add_library(pd_solver STATIC
+        pd_solver.cu
+    )
+    target_link_libraries(pd_solver PUBLIC cuda_ms_core)
+    set_target_properties(pd_solver PROPERTIES CUDA_ARCHITECTURES native)
+    target_compile_options(pd_solver PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
+
+    # Simulation tool
+    add_executable(sim_cloth tools/sim_cloth.cpp)
+    target_link_libraries(sim_cloth PRIVATE pd_solver cuda_ms_core)
+else()
+    message(WARNING "CUDA not available - PD solver disabled")
+endif()
+
 # ---- Tests ----
 foreach(t test_mesh test_topology test_constraints)
     add_executable(${t} tests/${t}.cpp)
-    target_link_libraries(${t} PRIVATE cuda_ms_core)
+    if(HAVE_CUDA)
+        target_link_libraries(${t} PRIVATE cuda_ms_core pd_solver)
+    else()
+        target_link_libraries(${t} PRIVATE cuda_ms_core)
+    endif()
 endforeach()

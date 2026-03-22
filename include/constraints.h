@@ -23,4 +23,13 @@ struct Constraints {
 
     void clear();
     void print_stats() const;
+
+    // ---- GPU support ----
+    int* d_pinned_indices = nullptr;      // device pointer [num_pinned]
+    float* d_target_pos = nullptr;        // device pointer [num_pinned * 3]
+    int num_pinned = 0;
+
+    void upload_to_gpu();
+    void free_gpu();
+    void apply_gpu(float* d_pos, float* d_vel) const;  // set pinned vertices
 };

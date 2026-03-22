@@ -22,13 +22,21 @@ ClothMesh::~ClothMesh() {
 void ClothMesh::free_gpu() {
 #ifdef CUDA_MS_HAVE_CUDA
     auto safe_free = [](void* p) { if (p) cudaFree(p); };
-    safe_free(d_pos);         d_pos         = nullptr;
-    safe_free(d_vel);         d_vel         = nullptr;
-    safe_free(d_tris);        d_tris        = nullptr;
-    safe_free(d_Dm_inv);      d_Dm_inv      = nullptr;
-    safe_free(d_rest_area);   d_rest_area   = nullptr;
-    safe_free(d_mass);        d_mass        = nullptr;
-    safe_free(d_inner_edges); d_inner_edges = nullptr;
+    safe_free(d_pos);          d_pos          = nullptr;
+    safe_free(d_vel);          d_vel          = nullptr;
+    safe_free(d_prev_pos);     d_prev_pos     = nullptr;
+    safe_free(d_tris);         d_tris         = nullptr;
+    safe_free(d_Dm_inv);       d_Dm_inv       = nullptr;
+    safe_free(d_rest_area);    d_rest_area    = nullptr;
+    safe_free(d_mass);         d_mass         = nullptr;
+    safe_free(d_inner_edges);  d_inner_edges  = nullptr;
+    safe_free(d_stretch_edges); d_stretch_edges = nullptr;
+    safe_free(d_stretch_rest);  d_stretch_rest  = nullptr;
+    safe_free(d_stretch_k);     d_stretch_k     = nullptr;
+    safe_free(d_jacobi_diag);   d_jacobi_diag   = nullptr;
+    safe_free(d_bend_quads);    d_bend_quads    = nullptr;
+    safe_free(d_bend_rest);     d_bend_rest     = nullptr;
+    safe_free(d_bend_k);        d_bend_k        = nullptr;
 #endif
 }
 
@@ -237,6 +245,38 @@ void ClothMesh::upload_to_gpu() {
 
     cudaMalloc((void**)&d_vel, N * 3 * sizeof(float));
     cudaMemset(d_vel, 0, N * 3 * sizeof(float));
+
+    // Allocate prev_pos for Chebyshev
+    cudaMalloc((void**)&d_prev_pos, N * 3 * sizeof(float));
+    cudaMemset(d_prev_pos, 0, N * 3 * sizeof(float));
+
+    // Upload stretch constraints
+    if (num_stretch_cons > 0) {
+        std::vector<int> h_edges(num_stretch_cons * 2);
+        std::vector<float> h_rest(num_stretch_cons);
+        std::vector<float> h_k(num_stretch_cons);
+        for (int i = 0; i < num_stretch_cons; ++i) {
+            h_edges[i * 2 + 0] = static_cast<int>(stretch_constraints[i](0));
+            h_edges[i * 2 + 1] = static_cast<int>(stretch_constraints[i](1));
+            h_rest[i] = stretch_constraints[i](2);
+            h_k[i] = stretch_constraints[i](3);
+        }
+        alloc_and_copy((void**)&d_stretch_edges, h_edges.data(), num_stretch_cons * 2 * sizeof(int));
+        alloc_and_copy((void**)&d_stretch_rest, h_rest.data(), num_stretch_cons * sizeof(float));
+        alloc_and_copy((void**)&d_stretch_k, h_k.data(), num_stretch_cons * sizeof(float));
+    }
+
+    // Upload bend constraints (Phase 4)
+    if (!bend_rest_angles.empty()) {
+        int E = num_inner_edges;
+        alloc_and_copy((void**)&d_bend_quads, d_inner_edges, E * 4 * sizeof(int)); // reuse inner_edges
+        cudaMalloc((void**)&d_bend_rest, E * sizeof(float));
+        cudaMemcpy(d_bend_rest, bend_rest_angles.data(), E * sizeof(float), cudaMemcpyHostToDevice);
+        cudaMalloc((void**)&d_bend_k, E * sizeof(float));
+        std::vector<float> h_bend_k(E);
+        for (int i = 0; i < E; ++i) h_bend_k[i] = bend_stiffness[i];
+        cudaMemcpy(d_bend_k, h_bend_k.data(), E * sizeof(float), cudaMemcpyHostToDevice);
+    }
 #else
     fprintf(stderr, "upload_to_gpu: CUDA not compiled in — skipping.\n");
 #endif
@@ -270,5 +310,119 @@ void ClothMesh::print_stats() const {
     }
 
     printf("  Inner edges: %d\n", num_inner_edges);
+    printf("  Stretch constraints: %d\n", num_stretch_cons);
     printf("  GPU buffers: %s\n", (d_pos != nullptr) ? "allocated" : "not allocated");
+}
+
+// ---- PD Constraint Building ----
+
+void ClothMesh::build_stretch_constraints(float stiffness) {
+    // Build unique edge set from triangles
+    struct Edge {
+        int v0, v1;
+        bool operator==(const Edge& other) const {
+            return (v0 == other.v0 && v1 == other.v1) ||
+                   (v0 == other.v1 && v1 == other.v0);
+        }
+    };
+    struct EdgeHash {
+        size_t operator()(const Edge& e) const {
+            // Order-independent hash
+            long long k = (static_cast<long long>(std::min(e.v0, e.v1)) << 32) |
+                          static_cast<unsigned>(std::max(e.v0, e.v1));
+            return std::hash<long long>()(k);
+        }
+    };
+
+    std::unordered_map<Edge, float, EdgeHash> edge_map;
+    edge_map.reserve(num_tris * 3);
+
+    for (const auto& tri : triangles) {
+        int v0 = tri(0), v1 = tri(1), v2 = tri(2);
+        Edge edges[3] = {{v0, v1}, {v1, v2}, {v0, v2}};
+        for (const auto& e : edges) {
+            if (edge_map.find(e) == edge_map.end()) {
+                // Compute rest length
+                Eigen::Vector3f p0 = rest_pos[e.v0];
+                Eigen::Vector3f p1 = rest_pos[e.v1];
+                float len = (p1 - p0).norm();
+                edge_map[e] = len;
+            }
+        }
+    }
+
+    stretch_constraints.clear();
+    stretch_constraints.reserve(edge_map.size());
+    for (const auto& kv : edge_map) {
+        const Edge& e = kv.first;
+        float rest_len = kv.second;
+        stretch_constraints.emplace_back(e.v0, e.v1, rest_len, stiffness);
+    }
+    num_stretch_cons = static_cast<int>(stretch_constraints.size());
+}
+
+void ClothMesh::build_bend_constraints(float stiffness) {
+    // Requires inner_edges to be built first
+    if (inner_edges.empty()) {
+        build_inner_edges();
+    }
+
+    bend_rest_angles.resize(num_inner_edges);
+    bend_stiffness.assign(num_inner_edges, stiffness);
+
+    for (int e = 0; e < num_inner_edges; ++e) {
+        int v0 = inner_edges[e](0);
+        int v1 = inner_edges[e](1);
+        int v2 = inner_edges[e](2);  // opposite in tri A
+        int v3 = inner_edges[e](3);  // opposite in tri B
+
+        // Compute current dihedral angle
+        Eigen::Vector3f p0 = rest_pos[v0];
+        Eigen::Vector3f p1 = rest_pos[v1];
+        Eigen::Vector3f p2 = rest_pos[v2];
+        Eigen::Vector3f p3 = rest_pos[v3];
+
+        Eigen::Vector3f n1 = (p1 - p0).cross(p2 - p0);
+        Eigen::Vector3f n2 = (p3 - p0).cross(p1 - p0);
+
+        if (n1.norm() > 1e-10f && n2.norm() > 1e-10f) {
+            n1.normalize();
+            n2.normalize();
+            float cos_theta = std::clamp(n1.dot(n2), -1.0f, 1.0f);
+            bend_rest_angles[e] = std::acos(cos_theta);
+        } else {
+            bend_rest_angles[e] = 0.0f;
+        }
+    }
+}
+
+void ClothMesh::precompute_jacobi_diag(float dt, float constraint_wt) {
+    // Compute diagonal of system matrix A = M + h² * Σ w_i * A_i^T * A_i
+    // For stretch constraint on edge (i,j):
+    //   A_i^T * A_i contributes [ w, -w; -w, w ] to the 2x2 block
+    // For bend constraint on quad (i,j,k,l): more complex (Phase 4)
+
+    std::vector<float> diag(num_verts, 0.0f);
+
+    // Mass contribution
+    for (int i = 0; i < num_verts; ++i) {
+        diag[i] = mass[i];
+    }
+
+    // Stretch constraint contribution
+    float h2_w = dt * dt * constraint_wt;
+    for (const auto& cons : stretch_constraints) {
+        int v0 = static_cast<int>(cons(0));
+        int v1 = static_cast<int>(cons(1));
+        float w = cons(3);  // stiffness
+
+        diag[v0] += h2_w * w * 2.0f;  // A^T*A = [1,-1;-1,1] for edge, diagonal is 2
+        diag[v1] += h2_w * w * 2.0f;
+    }
+
+#ifdef CUDA_MS_HAVE_CUDA
+    if (d_jacobi_diag) cudaFree(d_jacobi_diag);
+    cudaMalloc((void**)&d_jacobi_diag, num_verts * sizeof(float));
+    cudaMemcpy(d_jacobi_diag, diag.data(), num_verts * sizeof(float), cudaMemcpyHostToDevice);
+#endif
 }

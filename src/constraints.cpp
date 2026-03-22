@@ -4,6 +4,10 @@
 #include <cassert>
 #include <cstdio>
 
+#ifdef CUDA_MS_HAVE_CUDA
+#include <cuda_runtime.h>
+#endif
+
 // ---- Preset boundary conditions ----
 
 void Constraints::pin_top_row(const ClothMesh& mesh, int ncols)
@@ -67,4 +71,54 @@ void Constraints::print_stats() const
             printf(" %d", idx);
         printf("\n");
     }
+}
+
+// ---- GPU methods ----
+
+void Constraints::upload_to_gpu()
+{
+#ifdef CUDA_MS_HAVE_CUDA
+    free_gpu();
+
+    num_pinned = static_cast<int>(pinned_indices.size());
+    if (num_pinned == 0) return;
+
+    cudaMalloc((void**)&d_pinned_indices, num_pinned * sizeof(int));
+    cudaMemcpy(d_pinned_indices, pinned_indices.data(), num_pinned * sizeof(int), cudaMemcpyHostToDevice);
+
+    // Extract target positions for pinned vertices only
+    std::vector<float> pinned_targets(num_pinned * 3);
+    for (int i = 0; i < num_pinned; ++i) {
+        int idx = pinned_indices[i];
+        pinned_targets[i * 3 + 0] = target_positions[idx * 3 + 0];
+        pinned_targets[i * 3 + 1] = target_positions[idx * 3 + 1];
+        pinned_targets[i * 3 + 2] = target_positions[idx * 3 + 2];
+    }
+    cudaMalloc((void**)&d_target_pos, num_pinned * 3 * sizeof(float));
+    cudaMemcpy(d_target_pos, pinned_targets.data(), num_pinned * 3 * sizeof(float), cudaMemcpyHostToDevice);
+#endif
+}
+
+void Constraints::free_gpu()
+{
+#ifdef CUDA_MS_HAVE_CUDA
+    if (d_pinned_indices) { cudaFree(d_pinned_indices); d_pinned_indices = nullptr; }
+    if (d_target_pos) { cudaFree(d_target_pos); d_target_pos = nullptr; }
+    num_pinned = 0;
+#endif
+}
+
+void Constraints::apply_gpu(float* d_pos, float* d_vel) const
+{
+#ifdef CUDA_MS_HAVE_CUDA
+    if (num_pinned == 0 || d_pinned_indices == nullptr) return;
+
+    // Kernel wrapper - defined in pd_solver.cu
+    extern void launch_apply_constraints_kernel(
+        float* d_pos, float* d_vel,
+        const int* d_indices, const float* d_target,
+        int num_pinned);
+
+    launch_apply_constraints_kernel(d_pos, d_vel, d_pinned_indices, d_target_pos, num_pinned);
+#endif
 }
