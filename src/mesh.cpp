@@ -382,23 +382,42 @@ void ClothMesh::build_bend_constraints(float stiffness) {
         int v2 = inner_edges[e](2);  // opposite in tri A
         int v3 = inner_edges[e](3);  // opposite in tri B
 
-        // Compute current dihedral angle
+        // Compute dihedral angle using the SAME wing-vector convention as
+        // bend_project_kernel: angle between the perpendicular components of
+        // v2 and v3 relative to the shared edge axis.
+        // For a flat cloth this gives ~π (v2 and v3 on opposite sides).
         Eigen::Vector3f p0 = rest_pos[v0];
         Eigen::Vector3f p1 = rest_pos[v1];
         Eigen::Vector3f p2 = rest_pos[v2];
         Eigen::Vector3f p3 = rest_pos[v3];
 
-        Eigen::Vector3f n1 = (p1 - p0).cross(p2 - p0);
-        Eigen::Vector3f n2 = (p3 - p0).cross(p1 - p0);
-
-        if (n1.norm() > 1e-10f && n2.norm() > 1e-10f) {
-            n1.normalize();
-            n2.normalize();
-            float cos_theta = std::clamp(n1.dot(n2), -1.0f, 1.0f);
-            bend_rest_angles[e] = std::acos(cos_theta);
-        } else {
-            bend_rest_angles[e] = 0.0f;
+        Eigen::Vector3f edge = p1 - p0;
+        float edge_len = edge.norm();
+        if (edge_len < 1e-10f) {
+            bend_rest_angles[e] = static_cast<float>(M_PI);
+            continue;
         }
+        Eigen::Vector3f ax = edge / edge_len;
+
+        // Wing vectors: perpendicular component of v2 and v3 from the edge
+        auto wing = [&](const Eigen::Vector3f& p) {
+            float t = (p - p0).dot(ax);
+            return (p - p0) - t * ax;
+        };
+        Eigen::Vector3f r2 = wing(p2);
+        Eigen::Vector3f r3 = wing(p3);
+        float r2_len = r2.norm(), r3_len = r3.norm();
+
+        if (r2_len < 1e-10f || r3_len < 1e-10f) {
+            bend_rest_angles[e] = static_cast<float>(M_PI);
+            continue;
+        }
+        Eigen::Vector3f r2h = r2 / r2_len;
+        Eigen::Vector3f r3h = r3 / r3_len;
+
+        float cos_t = std::clamp(r2h.dot(r3h), -1.0f, 1.0f);
+        float sin_t = r2h.cross(r3h).dot(ax);
+        bend_rest_angles[e] = std::atan2(sin_t, cos_t);
     }
     num_bend_cons = num_inner_edges;
 }
