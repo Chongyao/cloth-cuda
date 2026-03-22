@@ -322,7 +322,15 @@ __global__ void bend_project_kernel(
     float sin_t = cr.x*ax.x + cr.y*ax.y + cr.z*ax.z;
     float theta = atan2f(sin_t, cos_t);
 
-    float half_delta = (theta - rest_angles[e]) * 0.5f;
+    // Wrap angle difference to (-π, π] to avoid discontinuity at ±π
+    float diff = theta - rest_angles[e];
+    if (diff >  3.14159265f) diff -= 6.28318530f;
+    if (diff < -3.14159265f) diff += 6.28318530f;
+
+    // Cap per-step correction: Jacobi-PD diverges for large nonlinear rotations.
+    // Bending stiffness should be << stretch stiffness for Jacobi convergence.
+    const float MAX_HALF_DELTA = 0.17453f;  // 10° per iteration
+    float half_delta = fmaxf(-MAX_HALF_DELTA, fminf(MAX_HALF_DELTA, diff * 0.5f));
 
     // Rodrigues rotation around ax (r is perpendicular to ax, so ax·r = 0)
     auto rotate_perp = [&](float3 r, float angle) -> float3 {
@@ -347,7 +355,9 @@ __global__ void bend_project_kernel(
     projections[e*4+3] = {f3.x+r3_new.x, f3.y+r3_new.y, f3.z+r3_new.z};
 }
 
-// Accumulate bend constraint RHS contributions (atomicAdd, same pattern as stretch)
+// Accumulate bend constraint RHS contributions — only v2/v3 (wing vertices).
+// v0/v1 (shared edge) project to their current positions, so including them
+// would add a spurious "pull toward current pos" term and bloat the diagonal.
 __global__ void accumulate_bend_rhs_kernel(
     const int*   __restrict__ quads,
     const float3* __restrict__ projections,
@@ -359,15 +369,11 @@ __global__ void accumulate_bend_rhs_kernel(
     int e = blockIdx.x * blockDim.x + threadIdx.x;
     if (e >= num_bends) return;
 
-    int v0 = quads[e*4+0], v1 = quads[e*4+1];
     int v2 = quads[e*4+2], v3 = quads[e*4+3];
     float w = stiffness[e] * h2;
 
-    float3 p0 = projections[e*4+0], p1 = projections[e*4+1];
     float3 p2 = projections[e*4+2], p3 = projections[e*4+3];
 
-    atomicAdd(&rhs[v0*3+0], w*p0.x); atomicAdd(&rhs[v0*3+1], w*p0.y); atomicAdd(&rhs[v0*3+2], w*p0.z);
-    atomicAdd(&rhs[v1*3+0], w*p1.x); atomicAdd(&rhs[v1*3+1], w*p1.y); atomicAdd(&rhs[v1*3+2], w*p1.z);
     atomicAdd(&rhs[v2*3+0], w*p2.x); atomicAdd(&rhs[v2*3+1], w*p2.y); atomicAdd(&rhs[v2*3+2], w*p2.z);
     atomicAdd(&rhs[v3*3+0], w*p3.x); atomicAdd(&rhs[v3*3+1], w*p3.y); atomicAdd(&rhs[v3*3+2], w*p3.z);
 }

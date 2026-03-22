@@ -446,12 +446,12 @@ void ClothMesh::precompute_jacobi_diag(float dt, float /*constraint_wt*/) {
         diag[v1] += h2 * w;
     }
 
-    // Bend: each inner-edge quad (v0,v1,v2,v3) contributes h²*w to all 4 vertices
+    // Bend: only v2 and v3 (wing vertices) contribute — v0/v1 (shared edge)
+    // are projected to their current positions, so they must NOT be counted
+    // here or they gain an artificial "pull toward current pos" term.
     for (int e = 0; e < num_inner_edges; ++e) {
         float w = bend_stiffness.empty() ? 0.0f : bend_stiffness[e];
         if (w == 0.0f) continue;
-        diag[inner_edges[e](0)] += h2 * w;
-        diag[inner_edges[e](1)] += h2 * w;
         diag[inner_edges[e](2)] += h2 * w;
         diag[inner_edges[e](3)] += h2 * w;
     }

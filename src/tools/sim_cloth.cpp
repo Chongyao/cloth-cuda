@@ -104,6 +104,8 @@ void print_usage(const char* prog) {
     fprintf(stderr, "  --iter <n>         PD iterations per frame (default: 50)\n");
     fprintf(stderr, "  --type <n>         Mesh type: 0=uniform\\, 1=checker, 2=uniform/, 3=米字格 (default: 3)\n");
     fprintf(stderr, "  --bend <k>         Bend stiffness (default: 0 = disabled)\n");
+    fprintf(stderr, "                     Jacobi-PD converges for k << stretch; recommend k <= 0.05\n");
+    fprintf(stderr, "  --gravity <g>      Gravity acceleration (default: -9.8)\n");
     fprintf(stderr, "  --export <dir>     Export frames to directory\n");
     fprintf(stderr, "  --verbose          Print per-frame statistics\n");
     fprintf(stderr, "\nExample:\n");
@@ -127,7 +129,8 @@ int main(int argc, char* argv[]) {
     float stiffness = 1.0f;
     int iterations = 50;
     int mesh_type = 3;
-    float bend_stiffness = 0.0f;  // 0 = bend disabled
+    float bend_stiffness = 0.0f;
+    float gravity = -9.8f;
     std::string export_dir;
     bool verbose = false;
 
@@ -148,6 +151,8 @@ int main(int argc, char* argv[]) {
             mesh_type = std::stoi(argv[++i]);
         } else if (arg == "--bend" && i + 1 < argc) {
             bend_stiffness = std::stof(argv[++i]);
+        } else if (arg == "--gravity" && i + 1 < argc) {
+            gravity = std::stof(argv[++i]);
         } else if (arg == "--export" && i + 1 < argc) {
             export_dir = argv[++i];
         } else if (arg == "--verbose") {
@@ -193,6 +198,7 @@ int main(int argc, char* argv[]) {
     config.dt = dt;
     config.max_iterations = iterations;
     config.stretch_stiffness = stiffness;
+    config.gravity = gravity;
     config.use_chebyshev = true;
 
     PDSolver solver(config, mesh);
