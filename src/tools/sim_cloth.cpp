@@ -102,6 +102,7 @@ void print_usage(const char* prog) {
     fprintf(stderr, "  --pin <mode>       Constraint mode: top, corners (default: top)\n");
     fprintf(stderr, "  --stiffness <k>    Stretch stiffness (default: 1.0)\n");
     fprintf(stderr, "  --iter <n>         PD iterations per frame (default: 50)\n");
+    fprintf(stderr, "  --type <n>         Mesh type: 0=uniform\\, 1=checker, 2=uniform/, 3=米字格 (default: 3)\n");
     fprintf(stderr, "  --export <dir>     Export frames to directory\n");
     fprintf(stderr, "  --verbose          Print per-frame statistics\n");
     fprintf(stderr, "\nExample:\n");
@@ -124,6 +125,7 @@ int main(int argc, char* argv[]) {
     std::string pin_mode = "top";
     float stiffness = 1.0f;
     int iterations = 50;
+    int mesh_type = 3;  // 3 = 米字格 (cross pattern, isotropic)
     std::string export_dir;
     bool verbose = false;
 
@@ -140,6 +142,8 @@ int main(int argc, char* argv[]) {
             stiffness = std::stof(argv[++i]);
         } else if (arg == "--iter" && i + 1 < argc) {
             iterations = std::stoi(argv[++i]);
+        } else if (arg == "--type" && i + 1 < argc) {
+            mesh_type = std::stoi(argv[++i]);
         } else if (arg == "--export" && i + 1 < argc) {
             export_dir = argv[++i];
         } else if (arg == "--verbose") {
@@ -150,11 +154,11 @@ int main(int argc, char* argv[]) {
     printf("=== PD Cloth Simulation ===\n");
     printf("Grid: %d x %d, Cell size: %f\n", nrows, ncols, size);
     printf("Steps: %d, dt: %f, Iterations: %d\n", steps, dt, iterations);
-    printf("Stiffness: %f, Pin: %s\n", stiffness, pin_mode.c_str());
+    printf("Stiffness: %f, Pin: %s, Mesh type: %d\n", stiffness, pin_mode.c_str(), mesh_type);
 
     // Generate mesh
     ClothMesh mesh;
-    generate_square_cloth(nrows, ncols, size, 0, mesh);
+    generate_square_cloth(nrows, ncols, size, mesh_type, mesh);
     mesh.precompute_rest_state(0.1f);
     mesh.build_stretch_constraints(stiffness);
 
