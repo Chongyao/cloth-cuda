@@ -263,6 +263,115 @@ __global__ void clear_rhs_kernel(float* rhs, int N)
     rhs[idx * 3 + 2] = 0.0f;
 }
 
+// Bend constraint projection: rotate the two triangle "wings" around the shared
+// edge so the dihedral angle matches rest_angle.
+// Each bend constraint stores quad (v0,v1,v2,v3): v0-v1 = shared edge,
+// v2 = opposite vertex in tri A, v3 = opposite vertex in tri B.
+__global__ void bend_project_kernel(
+    const float* __restrict__ pos,
+    const int*   __restrict__ quads,        // [E_bend*4]
+    const float* __restrict__ rest_angles,  // [E_bend]
+    float3*      __restrict__ projections,  // [E_bend*4] output
+    int num_bends)
+{
+    int e = blockIdx.x * blockDim.x + threadIdx.x;
+    if (e >= num_bends) return;
+
+    int v0 = quads[e*4+0], v1 = quads[e*4+1];
+    int v2 = quads[e*4+2], v3 = quads[e*4+3];
+
+    float3 p0 = make_float3(pos[v0*3], pos[v0*3+1], pos[v0*3+2]);
+    float3 p1 = make_float3(pos[v1*3], pos[v1*3+1], pos[v1*3+2]);
+    float3 p2 = make_float3(pos[v2*3], pos[v2*3+1], pos[v2*3+2]);
+    float3 p3 = make_float3(pos[v3*3], pos[v3*3+1], pos[v3*3+2]);
+
+    // Default: no change
+    projections[e*4+0] = p0;
+    projections[e*4+1] = p1;
+    projections[e*4+2] = p2;
+    projections[e*4+3] = p3;
+
+    // Shared edge axis
+    float3 edge = {p1.x-p0.x, p1.y-p0.y, p1.z-p0.z};
+    float edge_len = sqrtf(edge.x*edge.x + edge.y*edge.y + edge.z*edge.z);
+    if (edge_len < 1e-10f) return;
+    float3 ax = {edge.x/edge_len, edge.y/edge_len, edge.z/edge_len};
+
+    // Perpendicular components of v2 and v3 relative to the edge line
+    auto perp_from_edge = [&](float3 p) -> float3 {
+        float t = (p.x-p0.x)*ax.x + (p.y-p0.y)*ax.y + (p.z-p0.z)*ax.z;
+        float3 foot = {p0.x+t*ax.x, p0.y+t*ax.y, p0.z+t*ax.z};
+        return {p.x-foot.x, p.y-foot.y, p.z-foot.z};
+    };
+
+    float3 r2 = perp_from_edge(p2);
+    float3 r3 = perp_from_edge(p3);
+    float r2_len = sqrtf(r2.x*r2.x + r2.y*r2.y + r2.z*r2.z);
+    float r3_len = sqrtf(r3.x*r3.x + r3.y*r3.y + r3.z*r3.z);
+    if (r2_len < 1e-10f || r3_len < 1e-10f) return;
+
+    float3 r2h = {r2.x/r2_len, r2.y/r2_len, r2.z/r2_len};
+    float3 r3h = {r3.x/r3_len, r3.y/r3_len, r3.z/r3_len};
+
+    // Current dihedral angle (signed, around ax)
+    float cos_t = fmaxf(-1.0f, fminf(1.0f,
+        r2h.x*r3h.x + r2h.y*r3h.y + r2h.z*r3h.z));
+    float3 cr = {r2h.y*r3h.z - r2h.z*r3h.y,
+                 r2h.z*r3h.x - r2h.x*r3h.z,
+                 r2h.x*r3h.y - r2h.y*r3h.x};
+    float sin_t = cr.x*ax.x + cr.y*ax.y + cr.z*ax.z;
+    float theta = atan2f(sin_t, cos_t);
+
+    float half_delta = (theta - rest_angles[e]) * 0.5f;
+
+    // Rodrigues rotation around ax (r is perpendicular to ax, so ax·r = 0)
+    auto rotate_perp = [&](float3 r, float angle) -> float3 {
+        float ca = cosf(angle), sa = sinf(angle);
+        float3 cr2 = {ax.y*r.z - ax.z*r.y, ax.z*r.x - ax.x*r.z, ax.x*r.y - ax.y*r.x};
+        return {ca*r.x + sa*cr2.x, ca*r.y + sa*cr2.y, ca*r.z + sa*cr2.z};
+    };
+
+    // r2 rotates by -half_delta, r3 by +half_delta (symmetric correction)
+    float3 r2_new = rotate_perp(r2, -half_delta);
+    float3 r3_new = rotate_perp(r3,  half_delta);
+
+    // Recompute foot positions
+    auto foot = [&](float3 p) -> float3 {
+        float t = (p.x-p0.x)*ax.x + (p.y-p0.y)*ax.y + (p.z-p0.z)*ax.z;
+        return {p0.x+t*ax.x, p0.y+t*ax.y, p0.z+t*ax.z};
+    };
+    float3 f2 = foot(p2), f3 = foot(p3);
+
+    // Edge vertices (v0, v1) project to their current positions
+    projections[e*4+2] = {f2.x+r2_new.x, f2.y+r2_new.y, f2.z+r2_new.z};
+    projections[e*4+3] = {f3.x+r3_new.x, f3.y+r3_new.y, f3.z+r3_new.z};
+}
+
+// Accumulate bend constraint RHS contributions (atomicAdd, same pattern as stretch)
+__global__ void accumulate_bend_rhs_kernel(
+    const int*   __restrict__ quads,
+    const float3* __restrict__ projections,
+    const float* __restrict__ stiffness,
+    float*       __restrict__ rhs,
+    int num_bends,
+    float h2)
+{
+    int e = blockIdx.x * blockDim.x + threadIdx.x;
+    if (e >= num_bends) return;
+
+    int v0 = quads[e*4+0], v1 = quads[e*4+1];
+    int v2 = quads[e*4+2], v3 = quads[e*4+3];
+    float w = stiffness[e] * h2;
+
+    float3 p0 = projections[e*4+0], p1 = projections[e*4+1];
+    float3 p2 = projections[e*4+2], p3 = projections[e*4+3];
+
+    atomicAdd(&rhs[v0*3+0], w*p0.x); atomicAdd(&rhs[v0*3+1], w*p0.y); atomicAdd(&rhs[v0*3+2], w*p0.z);
+    atomicAdd(&rhs[v1*3+0], w*p1.x); atomicAdd(&rhs[v1*3+1], w*p1.y); atomicAdd(&rhs[v1*3+2], w*p1.z);
+    atomicAdd(&rhs[v2*3+0], w*p2.x); atomicAdd(&rhs[v2*3+1], w*p2.y); atomicAdd(&rhs[v2*3+2], w*p2.z);
+    atomicAdd(&rhs[v3*3+0], w*p3.x); atomicAdd(&rhs[v3*3+1], w*p3.y); atomicAdd(&rhs[v3*3+2], w*p3.z);
+}
+
 // ============================================================================
 // External wrapper for Constraints::apply_gpu
 // ============================================================================
@@ -288,17 +397,14 @@ PDSolver::PDSolver(const PDSolverConfig& config, ClothMesh& mesh)
     : config_(config)
     , num_verts_(mesh.num_verts)
     , num_stretch_cons_(mesh.num_stretch_cons)
-    , num_bend_cons_(0)
+    , num_bend_cons_(mesh.num_bend_cons)
 {
-    // Allocate GPU buffers
-    allocate_buffers(num_verts_, num_stretch_cons_, 0);
+    allocate_buffers(num_verts_, num_stretch_cons_, num_bend_cons_);
 
-    // Ensure mesh has uploaded stretch constraints
     if (!mesh.d_stretch_edges) {
         fprintf(stderr, "PDSolver ERROR: Mesh stretch constraints not uploaded to GPU\n");
         fprintf(stderr, "  Call mesh.build_stretch_constraints() and mesh.upload_to_gpu() first\n");
     }
-    // Note: d_jacobi_diag is set by precompute_jacobi_diag(), which should be called before step()
 }
 
 PDSolver::~PDSolver()
@@ -363,8 +469,10 @@ void PDSolver::step(ClothMesh& mesh, const Constraints& cons)
     float* d_pos_in = mesh.d_pos;
     float* d_pos_out = d_new_pos_;
 
+    const int E_bend = num_bend_cons_;
+
     for (int iter = 0; iter < config_.max_iterations; ++iter) {
-        // Local Step: Compute stretch projections
+        // --- Local Step ---
         if (E_stretch > 0) {
             int num_blocks = (E_stretch + block_size - 1) / block_size;
             stretch_project_kernel<<<num_blocks, block_size>>>(
@@ -377,26 +485,24 @@ void PDSolver::step(ClothMesh& mesh, const Constraints& cons)
             CUDA_CHECK(cudaGetLastError());
         }
 
-        // Global Step: Clear and accumulate RHS
+        if (E_bend > 0 && d_bend_proj_ && mesh.d_bend_quads) {
+            int num_blocks = (E_bend + block_size - 1) / block_size;
+            bend_project_kernel<<<num_blocks, block_size>>>(
+                d_pos_in,
+                mesh.d_bend_quads,
+                mesh.d_bend_rest,
+                reinterpret_cast<float3*>(d_bend_proj_),
+                E_bend);
+            CUDA_CHECK(cudaGetLastError());
+        }
+
+        // --- Global Step: RHS = M*y + h²*(stretch + bend contributions) ---
         {
             int num_blocks = (N + block_size - 1) / block_size;
             clear_rhs_kernel<<<num_blocks, block_size>>>(d_rhs_, N);
             CUDA_CHECK(cudaGetLastError());
         }
 
-        // Start with inertial term: M * y
-        // We need to add this - for now simplified as just copy predict
-        // Actually proper formula: RHS = M*y + h^2 * sum(w_c * A_c^T * p_c)
-        // M*y is the base, then we add constraint contributions
-
-        // Add inertial contribution
-        {
-            int num_blocks = (N + block_size - 1) / block_size;
-            // For now, simplify: numerator = M * predict
-            // We'll modify jacobi_divide to use predict directly with mass
-        }
-
-        // Accumulate stretch constraint contributions
         if (E_stretch > 0) {
             int num_blocks = (E_stretch + block_size - 1) / block_size;
             accumulate_stretch_rhs_kernel<<<num_blocks, block_size>>>(
@@ -404,6 +510,16 @@ void PDSolver::step(ClothMesh& mesh, const Constraints& cons)
                 reinterpret_cast<const float3*>(d_stretch_proj_),
                 mesh.d_stretch_k,
                 d_rhs_, E_stretch, h2);
+            CUDA_CHECK(cudaGetLastError());
+        }
+
+        if (E_bend > 0 && d_bend_proj_ && mesh.d_bend_quads) {
+            int num_blocks = (E_bend + block_size - 1) / block_size;
+            accumulate_bend_rhs_kernel<<<num_blocks, block_size>>>(
+                mesh.d_bend_quads,
+                reinterpret_cast<const float3*>(d_bend_proj_),
+                mesh.d_bend_k,
+                d_rhs_, E_bend, h2);
             CUDA_CHECK(cudaGetLastError());
         }
 

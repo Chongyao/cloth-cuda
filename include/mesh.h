@@ -38,10 +38,11 @@ struct ClothMesh {
     float* d_bend_k          = nullptr;  // [E_bend] stiffness weights
 
     // ---- Scalar members (same for .cpp and .cu) ----
-    int num_verts      = 0;
-    int num_tris       = 0;
-    int num_inner_edges = 0;
-    int num_stretch_cons = 0;  // stretch constraints count
+    int num_verts        = 0;
+    int num_tris         = 0;
+    int num_inner_edges  = 0;
+    int num_stretch_cons = 0;
+    int num_bend_cons    = 0;
 
 #ifndef __CUDACC__
     // ---- CPU raw data (ONLY for .cpp files) ----

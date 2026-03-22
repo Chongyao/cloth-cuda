@@ -103,6 +103,7 @@ void print_usage(const char* prog) {
     fprintf(stderr, "  --stiffness <k>    Stretch stiffness (default: 1.0)\n");
     fprintf(stderr, "  --iter <n>         PD iterations per frame (default: 50)\n");
     fprintf(stderr, "  --type <n>         Mesh type: 0=uniform\\, 1=checker, 2=uniform/, 3=米字格 (default: 3)\n");
+    fprintf(stderr, "  --bend <k>         Bend stiffness (default: 0 = disabled)\n");
     fprintf(stderr, "  --export <dir>     Export frames to directory\n");
     fprintf(stderr, "  --verbose          Print per-frame statistics\n");
     fprintf(stderr, "\nExample:\n");
@@ -125,7 +126,8 @@ int main(int argc, char* argv[]) {
     std::string pin_mode = "top";
     float stiffness = 1.0f;
     int iterations = 50;
-    int mesh_type = 3;  // 3 = 米字格 (cross pattern, isotropic)
+    int mesh_type = 3;
+    float bend_stiffness = 0.0f;  // 0 = bend disabled
     std::string export_dir;
     bool verbose = false;
 
@@ -144,6 +146,8 @@ int main(int argc, char* argv[]) {
             iterations = std::stoi(argv[++i]);
         } else if (arg == "--type" && i + 1 < argc) {
             mesh_type = std::stoi(argv[++i]);
+        } else if (arg == "--bend" && i + 1 < argc) {
+            bend_stiffness = std::stof(argv[++i]);
         } else if (arg == "--export" && i + 1 < argc) {
             export_dir = argv[++i];
         } else if (arg == "--verbose") {
@@ -154,16 +158,19 @@ int main(int argc, char* argv[]) {
     printf("=== PD Cloth Simulation ===\n");
     printf("Grid: %d x %d, Cell size: %f\n", nrows, ncols, size);
     printf("Steps: %d, dt: %f, Iterations: %d\n", steps, dt, iterations);
-    printf("Stiffness: %f, Pin: %s, Mesh type: %d\n", stiffness, pin_mode.c_str(), mesh_type);
+    printf("Stiffness: %f, Bend: %f, Pin: %s, Mesh type: %d\n",
+           stiffness, bend_stiffness, pin_mode.c_str(), mesh_type);
 
     // Generate mesh
     ClothMesh mesh;
     generate_square_cloth(nrows, ncols, size, mesh_type, mesh);
     mesh.precompute_rest_state(0.1f);
     mesh.build_stretch_constraints(stiffness);
+    if (bend_stiffness > 0.0f)
+        mesh.build_bend_constraints(bend_stiffness);
 
-    printf("\nMesh: %d vertices, %d triangles, %d stretch constraints\n",
-           mesh.num_verts, mesh.num_tris, mesh.num_stretch_cons);
+    printf("\nMesh: %d vertices, %d triangles, %d stretch, %d bend constraints\n",
+           mesh.num_verts, mesh.num_tris, mesh.num_stretch_cons, mesh.num_bend_cons);
 
     // Setup constraints
     Constraints cons;

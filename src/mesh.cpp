@@ -266,16 +266,22 @@ void ClothMesh::upload_to_gpu() {
         alloc_and_copy((void**)&d_stretch_k, h_k.data(), num_stretch_cons * sizeof(float));
     }
 
-    // Upload bend constraints (Phase 4)
+    // Upload bend constraints
     if (!bend_rest_angles.empty()) {
         int E = num_inner_edges;
-        alloc_and_copy((void**)&d_bend_quads, d_inner_edges, E * 4 * sizeof(int)); // reuse inner_edges
-        cudaMalloc((void**)&d_bend_rest, E * sizeof(float));
-        cudaMemcpy(d_bend_rest, bend_rest_angles.data(), E * sizeof(float), cudaMemcpyHostToDevice);
-        cudaMalloc((void**)&d_bend_k, E * sizeof(float));
+        // Flatten CPU inner_edges (Vector4i) to int array
+        std::vector<int> h_quads(E * 4);
+        for (int i = 0; i < E; ++i) {
+            h_quads[i*4+0] = inner_edges[i](0);
+            h_quads[i*4+1] = inner_edges[i](1);
+            h_quads[i*4+2] = inner_edges[i](2);
+            h_quads[i*4+3] = inner_edges[i](3);
+        }
+        alloc_and_copy((void**)&d_bend_quads, h_quads.data(), E * 4 * sizeof(int));
+        alloc_and_copy((void**)&d_bend_rest, bend_rest_angles.data(), E * sizeof(float));
         std::vector<float> h_bend_k(E);
         for (int i = 0; i < E; ++i) h_bend_k[i] = bend_stiffness[i];
-        cudaMemcpy(d_bend_k, h_bend_k.data(), E * sizeof(float), cudaMemcpyHostToDevice);
+        alloc_and_copy((void**)&d_bend_k, h_bend_k.data(), E * sizeof(float));
     }
 #else
     fprintf(stderr, "upload_to_gpu: CUDA not compiled in — skipping.\n");
@@ -394,6 +400,7 @@ void ClothMesh::build_bend_constraints(float stiffness) {
             bend_rest_angles[e] = 0.0f;
         }
     }
+    num_bend_cons = num_inner_edges;
 }
 
 void ClothMesh::precompute_jacobi_diag(float dt, float /*constraint_wt*/) {
@@ -409,15 +416,25 @@ void ClothMesh::precompute_jacobi_diag(float dt, float /*constraint_wt*/) {
         diag[i] = mass[i];
     }
 
-    // Stretch constraint contribution: each constraint on edge (v0,v1) contributes h²*w to both vertices
     float h2 = dt * dt;
+
+    // Stretch: each edge (v0,v1) contributes h²*w to both endpoints
     for (const auto& cons : stretch_constraints) {
         int v0 = static_cast<int>(cons(0));
         int v1 = static_cast<int>(cons(1));
-        float w = cons(3);  // per-edge stiffness
-
+        float w = cons(3);
         diag[v0] += h2 * w;
         diag[v1] += h2 * w;
+    }
+
+    // Bend: each inner-edge quad (v0,v1,v2,v3) contributes h²*w to all 4 vertices
+    for (int e = 0; e < num_inner_edges; ++e) {
+        float w = bend_stiffness.empty() ? 0.0f : bend_stiffness[e];
+        if (w == 0.0f) continue;
+        diag[inner_edges[e](0)] += h2 * w;
+        diag[inner_edges[e](1)] += h2 * w;
+        diag[inner_edges[e](2)] += h2 * w;
+        diag[inner_edges[e](3)] += h2 * w;
     }
 
 #ifdef CUDA_MS_HAVE_CUDA
