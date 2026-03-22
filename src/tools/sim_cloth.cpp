@@ -106,6 +106,7 @@ void print_usage(const char* prog) {
     fprintf(stderr, "  --bend <k>         Bend stiffness (default: 0 = disabled)\n");
     fprintf(stderr, "                     Jacobi-PD converges for k << stretch; recommend k <= 0.05\n");
     fprintf(stderr, "  --gravity <g>      Gravity acceleration (default: -9.8)\n");
+    fprintf(stderr, "  --damping <d>      Velocity damping 0-1 (default: 0 = no damping)\n");
     fprintf(stderr, "  --export <dir>     Export frames to directory\n");
     fprintf(stderr, "  --verbose          Print per-frame statistics\n");
     fprintf(stderr, "\nExample:\n");
@@ -131,6 +132,7 @@ int main(int argc, char* argv[]) {
     int mesh_type = 3;
     float bend_stiffness = 0.0f;
     float gravity = -9.8f;
+    float damping = 0.0f;
     std::string export_dir;
     bool verbose = false;
 
@@ -153,6 +155,8 @@ int main(int argc, char* argv[]) {
             bend_stiffness = std::stof(argv[++i]);
         } else if (arg == "--gravity" && i + 1 < argc) {
             gravity = std::stof(argv[++i]);
+        } else if (arg == "--damping" && i + 1 < argc) {
+            damping = std::stof(argv[++i]);
         } else if (arg == "--export" && i + 1 < argc) {
             export_dir = argv[++i];
         } else if (arg == "--verbose") {
@@ -163,8 +167,8 @@ int main(int argc, char* argv[]) {
     printf("=== PD Cloth Simulation ===\n");
     printf("Grid: %d x %d, Cell size: %f\n", nrows, ncols, size);
     printf("Steps: %d, dt: %f, Iterations: %d\n", steps, dt, iterations);
-    printf("Stiffness: %f, Bend: %f, Pin: %s, Mesh type: %d\n",
-           stiffness, bend_stiffness, pin_mode.c_str(), mesh_type);
+    printf("Stiffness: %f, Bend: %f, Damping: %f, Pin: %s, Mesh type: %d\n",
+           stiffness, bend_stiffness, damping, pin_mode.c_str(), mesh_type);
 
     // Generate mesh
     ClothMesh mesh;
@@ -199,6 +203,7 @@ int main(int argc, char* argv[]) {
     config.max_iterations = iterations;
     config.stretch_stiffness = stiffness;
     config.gravity = gravity;
+    config.damping = damping;
     config.use_chebyshev = true;
 
     PDSolver solver(config, mesh);

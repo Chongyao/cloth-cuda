@@ -10,6 +10,7 @@ struct PDSolverConfig {
     float dt = 0.01f;                 // Time step
     float stretch_stiffness = 1.0f;   // Stretch constraint weight
     float bend_stiffness = 0.0f;      // Bend constraint weight (Phase 4)
+    float damping = 0.0f;             // Velocity damping (0 = no damping, 0.99 = heavy)
 };
 
 // Forward declarations - definitions in mesh.h and constraints.h

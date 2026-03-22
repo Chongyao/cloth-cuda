@@ -575,7 +575,7 @@ void PDSolver::step(ClothMesh& mesh, const Constraints& cons)
         update_velocity_kernel<<<num_blocks, block_size>>>(
             d_prev_pos_, mesh.d_vel, nullptr,
             mesh.d_pos,
-            N, dt, 0.0f);
+            N, dt, config_.damping);
         CUDA_CHECK(cudaGetLastError());
         // Copy new positions (already in mesh.d_pos, no copy needed)
     }
