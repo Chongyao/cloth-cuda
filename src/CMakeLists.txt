@@ -118,7 +118,7 @@ else()
 endif()
 
 # ---- Tests ----
-foreach(t test_mesh test_topology test_constraints)
+foreach(t test_mesh test_topology test_constraints test_pd_constraints)
     add_executable(${t} tests/${t}.cpp)
     if(HAVE_CUDA)
         target_link_libraries(${t} PRIVATE cuda_ms_core pd_solver)
