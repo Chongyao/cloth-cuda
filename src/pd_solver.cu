@@ -11,11 +11,11 @@
 // CUDA Kernels
 // ============================================================================
 
-// Predict positions: y = x + h*v + h^2*g/m
+// Predict positions: y = x + h*v + h^2*g  (gravity is acceleration, not force)
 __global__ void predict_kernel(
     const float* __restrict__ pos,
     const float* __restrict__ vel,
-    const float* __restrict__ mass,
+    const float* __restrict__ /*mass*/,
     float* __restrict__ predict,
     int N,
     float dt,
@@ -24,11 +24,10 @@ __global__ void predict_kernel(
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= N) return;
 
-    float m = mass[idx];
-    float h2_over_m = (m > 1e-10f) ? (dt * dt / m) : 0.0f;
+    float h2g = dt * dt * gravity;
 
     predict[idx * 3 + 0] = pos[idx * 3 + 0] + dt * vel[idx * 3 + 0];
-    predict[idx * 3 + 1] = pos[idx * 3 + 1] + dt * vel[idx * 3 + 1] + h2_over_m * gravity;
+    predict[idx * 3 + 1] = pos[idx * 3 + 1] + dt * vel[idx * 3 + 1] + h2g;
     predict[idx * 3 + 2] = pos[idx * 3 + 2] + dt * vel[idx * 3 + 2];
 }
 
@@ -128,6 +127,22 @@ __global__ void jacobi_update_kernel(
     new_pos[idx * 3 + 0] = numerator.x * inv_diag;
     new_pos[idx * 3 + 1] = numerator.y * inv_diag;
     new_pos[idx * 3 + 2] = numerator.z * inv_diag;
+}
+
+// Add inertial term to RHS: rhs += M * predict
+__global__ void add_inertial_rhs_kernel(
+    float* __restrict__ rhs,
+    const float* __restrict__ mass,
+    const float* __restrict__ predict,
+    int N)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= N) return;
+
+    float m = mass[idx];
+    atomicAdd(&rhs[idx * 3 + 0], m * predict[idx * 3 + 0]);
+    atomicAdd(&rhs[idx * 3 + 1], m * predict[idx * 3 + 1]);
+    atomicAdd(&rhs[idx * 3 + 2], m * predict[idx * 3 + 2]);
 }
 
 // Accumulate constraint contributions to RHS (using atomicAdd)
@@ -297,6 +312,7 @@ void PDSolver::allocate_buffers(int N, int E_stretch, int E_bend)
     cudaMalloc((void**)&d_rhs_, N * 3 * sizeof(float));
     cudaMalloc((void**)&d_prev_pos_, N * 3 * sizeof(float));
     cudaMemset(d_prev_pos_, 0, N * 3 * sizeof(float));
+    cudaMalloc((void**)&d_new_pos_, N * 3 * sizeof(float));
 
     if (E_stretch > 0) {
         cudaMalloc((void**)&d_stretch_proj_, E_stretch * 2 * sizeof(float3));
@@ -311,6 +327,7 @@ void PDSolver::free_buffers()
     if (d_predict_) { cudaFree(d_predict_); d_predict_ = nullptr; }
     if (d_rhs_) { cudaFree(d_rhs_); d_rhs_ = nullptr; }
     if (d_prev_pos_) { cudaFree(d_prev_pos_); d_prev_pos_ = nullptr; }
+    if (d_new_pos_) { cudaFree(d_new_pos_); d_new_pos_ = nullptr; }
     if (d_stretch_proj_) { cudaFree(d_stretch_proj_); d_stretch_proj_ = nullptr; }
     if (d_bend_proj_) { cudaFree(d_bend_proj_); d_bend_proj_ = nullptr; }
 }
@@ -330,6 +347,9 @@ void PDSolver::step(ClothMesh& mesh, const Constraints& cons)
     const float dt = config_.dt;
     const float h2 = dt * dt;
 
+    // Save old position for velocity update later
+    CUDA_CHECK(cudaMemcpy(d_prev_pos_, mesh.d_pos, N * 3 * sizeof(float), cudaMemcpyDeviceToDevice));
+
     // Step 1: Predict positions
     {
         int num_blocks = (N + block_size - 1) / block_size;
@@ -339,22 +359,9 @@ void PDSolver::step(ClothMesh& mesh, const Constraints& cons)
         CUDA_CHECK(cudaGetLastError());
     }
 
-    // Initialize RHS with inertial term: M * y
-    {
-        int num_blocks = (N + block_size - 1) / block_size;
-        clear_rhs_kernel<<<num_blocks, block_size>>>(d_rhs_, N);
-        CUDA_CHECK(cudaGetLastError());
-
-        // Add M*y to RHS
-        // This is done implicitly in jacobi_divide_kernel
-    }
-
-    // Local-Global iterations
+    // Local-Global iterations (ping-pong between mesh.d_pos and d_new_pos_)
     float* d_pos_in = mesh.d_pos;
-    float* d_pos_out = d_rhs_;  // Temporarily reuse d_rhs_ buffer
-    // Actually we need proper ping-pong, let's allocate another temp buffer
-    // For now, use d_prev_pos_ as output buffer
-    d_pos_out = d_prev_pos_;
+    float* d_pos_out = d_new_pos_;
 
     for (int iter = 0; iter < config_.max_iterations; ++iter) {
         // Local Step: Compute stretch projections
@@ -400,24 +407,20 @@ void PDSolver::step(ClothMesh& mesh, const Constraints& cons)
             CUDA_CHECK(cudaGetLastError());
         }
 
+        // Add inertial term: rhs += M * predict
+        {
+            int num_blocks = (N + block_size - 1) / block_size;
+            add_inertial_rhs_kernel<<<num_blocks, block_size>>>(
+                d_rhs_, mesh.d_mass, d_predict_, N);
+            CUDA_CHECK(cudaGetLastError());
+        }
+
         // Jacobi division: x_new = rhs / jacobi_diag
         {
             int num_blocks = (N + block_size - 1) / block_size;
-            // First add mass*predict to rhs
-            // Actually we need a kernel for: rhs = M*predict + constraint_terms
-            // Then: new_pos = rhs / diag
-            // Simplified approach for now:
-            jacobi_update_kernel<<<num_blocks, block_size>>>(
-                d_predict_, mesh.d_mass, mesh.d_jacobi_diag,
-                reinterpret_cast<const int2*>(mesh.d_stretch_edges),
-                reinterpret_cast<const float3*>(d_stretch_proj_),
-                mesh.d_stretch_k,
-                d_pos_out, N, E_stretch, h2);
+            jacobi_divide_kernel<<<num_blocks, block_size>>>(
+                d_pos_out, d_rhs_, mesh.d_jacobi_diag, N);
             CUDA_CHECK(cudaGetLastError());
-
-            // Add the constraint RHS contributions
-            // Re-run accumulation into a temp buffer then add to output
-            // For now, let's use a simpler approach below
         }
 
         // Apply constraints
@@ -443,14 +446,16 @@ void PDSolver::step(ClothMesh& mesh, const Constraints& cons)
         CUDA_CHECK(cudaMemcpy(mesh.d_pos, d_pos_in, N * 3 * sizeof(float), cudaMemcpyDeviceToDevice));
     }
 
-    // Step 4: Update velocity
+    // Step 4: Update velocity: v = (x_new - x_old) / dt
+    // d_prev_pos_ has the old position saved at start of step
     {
         int num_blocks = (N + block_size - 1) / block_size;
         update_velocity_kernel<<<num_blocks, block_size>>>(
-            mesh.d_pos, mesh.d_vel, d_prev_pos_,  // Use d_prev_pos_ which has old positions
-            mesh.d_pos,  // new_pos is same as current pos now
-            N, dt, 0.0f);  // No additional damping here
+            d_prev_pos_, mesh.d_vel, nullptr,
+            mesh.d_pos,
+            N, dt, 0.0f);
         CUDA_CHECK(cudaGetLastError());
+        // Copy new positions (already in mesh.d_pos, no copy needed)
     }
 
     // Re-apply constraints to velocity

@@ -396,7 +396,7 @@ void ClothMesh::build_bend_constraints(float stiffness) {
     }
 }
 
-void ClothMesh::precompute_jacobi_diag(float dt, float constraint_wt) {
+void ClothMesh::precompute_jacobi_diag(float dt, float /*constraint_wt*/) {
     // Compute diagonal of system matrix A = M + h² * Σ w_i * A_i^T * A_i
     // For stretch constraint on edge (i,j):
     //   A_i^T * A_i contributes [ w, -w; -w, w ] to the 2x2 block
@@ -409,15 +409,15 @@ void ClothMesh::precompute_jacobi_diag(float dt, float constraint_wt) {
         diag[i] = mass[i];
     }
 
-    // Stretch constraint contribution
-    float h2_w = dt * dt * constraint_wt;
+    // Stretch constraint contribution: each constraint on edge (v0,v1) contributes h²*w to both vertices
+    float h2 = dt * dt;
     for (const auto& cons : stretch_constraints) {
         int v0 = static_cast<int>(cons(0));
         int v1 = static_cast<int>(cons(1));
-        float w = cons(3);  // stiffness
+        float w = cons(3);  // per-edge stiffness
 
-        diag[v0] += h2_w * w * 2.0f;  // A^T*A = [1,-1;-1,1] for edge, diagonal is 2
-        diag[v1] += h2_w * w * 2.0f;
+        diag[v0] += h2 * w;
+        diag[v1] += h2 * w;
     }
 
 #ifdef CUDA_MS_HAVE_CUDA

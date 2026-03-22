@@ -37,7 +37,8 @@ private:
     // Temporary GPU buffers
     float* d_predict_ = nullptr;      // Predicted positions (inertial term)
     float* d_rhs_ = nullptr;          // RHS for global step
-    float* d_prev_pos_ = nullptr;     // For Chebyshev acceleration
+    float* d_prev_pos_ = nullptr;     // Old position saved at step start (for velocity update)
+    float* d_new_pos_ = nullptr;      // Ping-pong buffer for Jacobi iterations
     float* d_stretch_proj_ = nullptr; // Stretch constraint projections
     float* d_bend_proj_ = nullptr;    // Bend constraint projections (Phase 4)
 
