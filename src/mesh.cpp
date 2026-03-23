@@ -37,6 +37,7 @@ void ClothMesh::free_gpu() {
     safe_free(d_bend_quads);    d_bend_quads    = nullptr;
     safe_free(d_bend_rest);     d_bend_rest     = nullptr;
     safe_free(d_bend_k);        d_bend_k        = nullptr;
+    safe_free(d_tri_stretch_k); d_tri_stretch_k = nullptr;
 #endif
 }
 
@@ -365,6 +366,13 @@ void ClothMesh::build_bend_from_topo(float stiffness) {
     printf("  Bend constraints from topo: %d\n", num_bend_cons);
 }
 
+void ClothMesh::build_tri_stretch(float stiffness) {
+    // Build triangle-based stretch constraints (Stiefel projection)
+    // Each triangle has a stiffness weight for its strain constraint
+    tri_stretch_k.assign(num_tris, stiffness);
+    printf("  Triangle stretch constraints: %d\n", num_tris);
+}
+
 // ---- GPU upload ----
 
 void ClothMesh::upload_to_gpu() {
@@ -460,6 +468,11 @@ void ClothMesh::upload_to_gpu() {
         std::vector<float> h_bend_k(E);
         for (int i = 0; i < E; ++i) h_bend_k[i] = bend_stiffness[i];
         alloc_and_copy((void**)&d_bend_k, h_bend_k.data(), E * sizeof(float));
+    }
+
+    // Upload triangle-based stretch stiffness (if defined)
+    if (!tri_stretch_k.empty()) {
+        alloc_and_copy((void**)&d_tri_stretch_k, tri_stretch_k.data(), T * sizeof(float));
     }
 #else
     fprintf(stderr, "upload_to_gpu: CUDA not compiled in — skipping.\n");
@@ -616,13 +629,28 @@ void ClothMesh::precompute_jacobi_diag(float dt, float /*constraint_wt*/) {
 
     float h2 = dt * dt;
 
-    // Stretch: each edge (v0,v1) contributes h²*w to both endpoints
-    for (const auto& cons : stretch_constraints) {
-        int v0 = static_cast<int>(cons(0));
-        int v1 = static_cast<int>(cons(1));
-        float w = cons(3);
-        diag[v0] += h2 * w;
-        diag[v1] += h2 * w;
+    // Triangle-based stretch (Stiefel projection)
+    // With Ds = [x1-x0, x2-x0] and F = Ds * Dm_inv where G = Dm_inv:
+    // Contribution to diagonal:
+    //   diag[v0] += h² * wA * ((g00+g10)² + (g01+g11)²)  [sum of columns, squared]
+    //   diag[v1] += h² * wA * (g00² + g01²)
+    //   diag[v2] += h² * wA * (g10² + g11²)
+    if (!tri_stretch_k.empty()) {
+        for (int t = 0; t < num_tris; ++t) {
+            int v0 = triangles[t](0);
+            int v1 = triangles[t](1);
+            int v2 = triangles[t](2);
+            float wA = tri_stretch_k[t] * rest_area[t];
+            float g00 = Dm_inv[t](0, 0);  // col 0, row 0
+            float g10 = Dm_inv[t](1, 0);  // col 0, row 1
+            float g01 = Dm_inv[t](0, 1);  // col 1, row 0
+            float g11 = Dm_inv[t](1, 1);  // col 1, row 1
+            float s0 = g00 + g10;
+            float s1 = g01 + g11;
+            diag[v0] += h2 * wA * (s0 * s0 + s1 * s1);
+            diag[v1] += h2 * wA * (g00 * g00 + g01 * g01);
+            diag[v2] += h2 * wA * (g10 * g10 + g11 * g11);
+        }
     }
 
     // Bend: only v2 and v3 (wing vertices) contribute — v0/v1 (shared edge)

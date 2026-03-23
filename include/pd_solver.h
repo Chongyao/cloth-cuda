@@ -32,7 +32,8 @@ public:
 private:
     PDSolverConfig config_;
     int num_verts_;
-    int num_stretch_cons_;
+    int num_tris_;                    // NEW: for triangle-based stretch
+    int num_stretch_cons_;            // DEPRECATED: edge-based stretch count (unused)
     int num_bend_cons_;
 
     // Temporary GPU buffers
@@ -40,7 +41,7 @@ private:
     float* d_rhs_ = nullptr;          // RHS for global step
     float* d_prev_pos_ = nullptr;     // Old position saved at step start (for velocity update)
     float* d_new_pos_ = nullptr;      // Ping-pong buffer for Jacobi iterations
-    float* d_stretch_proj_ = nullptr; // Stretch constraint projections
+    float* d_tri_stretch_proj_ = nullptr;  // Triangle stretch projections [T * 6] (R 3x2 stored as 6 floats)
     float* d_bend_proj_ = nullptr;    // Bend constraint projections (Phase 4)
 
     // Chebyshev state
@@ -55,7 +56,7 @@ private:
     void update_velocity(float* d_pos, float* d_vel, const float* d_new_pos);
     void chebyshev_accelerate(float* d_pos, float* d_new_pos);
 
-    void allocate_buffers(int N, int E_stretch, int E_bend);
+    void allocate_buffers(int N, int T, int E_bend);
     void free_buffers();
 };
 

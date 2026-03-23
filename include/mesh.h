@@ -37,6 +37,9 @@ struct ClothMesh {
     float* d_bend_rest       = nullptr;  // [E_bend] rest angles
     float* d_bend_k          = nullptr;  // [E_bend] stiffness weights
 
+    // Triangle-based stretch (Stiefel projection)
+    float* d_tri_stretch_k   = nullptr;  // [T] stiffness per triangle
+
     // ---- Scalar members (same for .cpp and .cu) ----
     int num_verts        = 0;
     int num_tris         = 0;
@@ -83,6 +86,9 @@ struct ClothMesh {
     // ---- CPU data (std::vector compatible) ----
     std::vector<float> rest_area;
     std::vector<float> mass;
+
+    // Triangle-based stretch (Stiefel projection)
+    std::vector<float> tri_stretch_k;   // [T]
 #endif
 
     // ---- Lifecycle ----
@@ -106,6 +112,9 @@ struct ClothMesh {
     void build_inner_edges();
     void build_stretch_constraints(float stiffness = 1.0f);
     void build_bend_constraints(float stiffness = 0.01f);
+
+    // Triangle-based stretch (Stiefel projection)
+    void build_tri_stretch(float stiffness = 1.0f);
 
     void precompute_jacobi_diag(float dt, float constraint_wt = 1.0f);
 #endif

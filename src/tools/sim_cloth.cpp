@@ -178,7 +178,7 @@ int main(int argc, char* argv[]) {
     // Build topology and constraints
     printf("\n=== Building Topology ===\n");
     mesh.build_topology();
-    mesh.build_stretch_from_topo(stiffness);
+    mesh.build_tri_stretch(stiffness);
     if (bend_stiffness > 0.0f)
         mesh.build_bend_from_topo(bend_stiffness);
 
