@@ -1,4 +1,4 @@
-#include "mesh.h"
+#include "cloth_mesh.h"
 #include "mesh_generator.h"
 #include "constraints.h"
 #include "tests/test_framework.h"

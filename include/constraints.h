@@ -1,5 +1,5 @@
 #pragma once
-#include "mesh.h"
+#include "cloth_mesh.h"
 #include <vector>
 
 struct Constraints {
@@ -18,8 +18,9 @@ struct Constraints {
     void set_from_list(const std::vector<int>& indices,
                        const ClothMesh& mesh);
 
-    // Copy current rest positions of pinned vertices into target_positions
-    void apply_to_mesh(ClothMesh& mesh) const;
+    // Reset mesh CPU positions to their pinned (rest) targets.
+    // Use only for resetting the rest state, not during GPU simulation.
+    void reset_to_rest(ClothMesh& mesh) const;
 
     void clear();
     void print_stats() const;

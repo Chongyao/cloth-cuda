@@ -1,6 +1,6 @@
 #pragma once
 
-#include "mesh.h"
+#include "cloth_mesh.h"
 #include <memory>
 
 class ClothViewerImpl;

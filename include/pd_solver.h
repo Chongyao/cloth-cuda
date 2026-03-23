@@ -2,65 +2,68 @@
 
 // PD Solver configuration
 struct PDSolverConfig {
-    int max_iterations = 50;          // Max local-global iterations per frame
-    float tolerance = 1e-4f;          // Convergence tolerance
-    bool use_chebyshev = true;        // Enable Chebyshev acceleration
-    float rho = 0.9f;                 // Spectral radius estimate for Chebyshev
-    float gravity = -9.8f;            // Gravity (m/s^2)
-    float dt = 0.01f;                 // Time step
-    float stretch_stiffness = 1.0f;   // Stretch constraint weight
-    float bend_stiffness = 0.0f;      // Bend constraint weight (Phase 4)
-    float damping = 0.0f;             // Velocity damping (0 = no damping, 0.99 = heavy)
+    int   max_iterations     = 50;    // local-global iterations per frame
+    float tolerance          = 1e-4f; // convergence tolerance (unused: Jacobi runs fixed iters)
+    bool  use_chebyshev      = true;  // enable Chebyshev acceleration
+    float rho                = 0.9f;  // spectral radius estimate for Chebyshev
+    float gravity            = -9.8f; // gravitational acceleration (m/s²)
+    float dt                 = 0.01f; // time step
+    float stretch_stiffness  = 1.0f;  // triangle stretch constraint weight
+    float bend_stiffness     = 0.0f;  // bend constraint weight
+    float damping            = 0.0f;  // velocity damping (0 = none, 1 = full)
 };
 
-// Forward declarations - definitions in mesh.h and constraints.h
+// Forward declarations
 struct ClothMesh;
+struct SimConstraints;
 struct Constraints;
 
-// GPU-based Projective Dynamics Solver
+// GPU-based Projective Dynamics solver.
+//
+// Usage:
+//   PDSolver solver(config, mesh, sim_cons);   // allocates temp GPU buffers
+//   // per frame:
+//   solver.step(mesh, sim_cons, pin_cons);
 class PDSolver {
 public:
-    PDSolver(const PDSolverConfig& config, ClothMesh& mesh);
+    PDSolver(const PDSolverConfig& config,
+             const ClothMesh& mesh,
+             const SimConstraints& sim_cons);
     ~PDSolver();
 
-    // Execute one simulation step
-    void step(ClothMesh& mesh, const Constraints& cons);
+    // Execute one simulation step (predict → local → global → velocity update).
+    void step(ClothMesh& mesh,
+              const SimConstraints& sim_cons,
+              const Constraints& pin_cons);
 
-    // Reset Chebyshev state (call when constraints change)
+    // Reset Chebyshev state (call when constraints change at runtime).
     void reset();
 
 private:
     PDSolverConfig config_;
     int num_verts_;
-    int num_tris_;                    // NEW: for triangle-based stretch
-    int num_stretch_cons_;            // DEPRECATED: edge-based stretch count (unused)
+    int num_tris_;
     int num_bend_cons_;
 
-    // Temporary GPU buffers
-    float* d_predict_ = nullptr;      // Predicted positions (inertial term)
-    float* d_rhs_ = nullptr;          // RHS for global step
-    float* d_prev_pos_ = nullptr;     // Old position saved at step start (for velocity update)
-    float* d_new_pos_ = nullptr;      // Ping-pong buffer for Jacobi iterations
-    float* d_tri_stretch_proj_ = nullptr;  // Triangle stretch projections [T * 6] (R 3x2 stored as 6 floats)
-    float* d_bend_proj_ = nullptr;    // Bend constraint projections (Phase 4)
+    // ---- Per-step temporary GPU buffers ----
+    float* d_predict_         = nullptr;  // [N*3] inertial prediction y
+    float* d_rhs_             = nullptr;  // [N*3] global step RHS accumulator
+    float* d_prev_pos_        = nullptr;  // [N*3] position at frame start (for v update)
+    float* d_new_pos_         = nullptr;  // [N*3] Jacobi ping-pong output
+    float* d_tri_stretch_proj_ = nullptr; // [T*6] Stiefel projection R per triangle
+    float* d_bend_proj_       = nullptr;  // [E_bend*4*3] bend projections
 
-    // Chebyshev state
-    float omega_prev_ = 1.0f;
-    float omega_curr_ = 1.0f;
-    int iter_count_ = 0;
-
-    // CUDA kernels (wrappers)
-    void predict_positions(float* d_pos, float* d_vel);
-    void local_step_stretch(const float* d_pos);
-    void global_step_jacobi(float* d_pos, float* d_new_pos);
-    void update_velocity(float* d_pos, float* d_vel, const float* d_new_pos);
-    void chebyshev_accelerate(float* d_pos, float* d_new_pos);
+    // ---- Chebyshev state ----
+    float omega_prev_  = 1.0f;
+    float omega_curr_  = 1.0f;
+    int   iter_count_  = 0;
 
     void allocate_buffers(int N, int T, int E_bend);
     void free_buffers();
+    void chebyshev_accelerate(float* d_pos, float* d_new_pos);
 };
 
-// External kernel wrappers for Constraints::apply_gpu
+// Kernel wrapper used by Constraints::apply_gpu (implemented in pd_solver.cu)
 void launch_apply_constraints_kernel(
     float* d_pos, float* d_vel,
     const int* d_indices, const float* d_target,

@@ -1,5 +1,5 @@
 #pragma once
-#include "mesh.h"
+#include "cloth_mesh.h"
 
 // Generate a regular square cloth mesh.
 //

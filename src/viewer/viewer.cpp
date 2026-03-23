@@ -182,7 +182,7 @@ void ClothViewer::upload_mesh(const ClothMesh& mesh) {
     // Store stats
     impl_->num_verts_ = mesh.num_verts;
     impl_->num_tris_ = mesh.num_tris;
-    impl_->num_inner_edges_ = mesh.num_inner_edges;
+    impl_->num_inner_edges_ = 0;  // computed externally via MeshTopology if needed
 
     // Flatten vertex positions
     std::vector<float> vertices;
