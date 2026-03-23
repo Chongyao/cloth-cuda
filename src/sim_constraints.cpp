@@ -10,7 +10,7 @@
 #endif
 
 // ============================================================================
-// CPU build methods
+// CPU build: stretch
 // ============================================================================
 
 void SimConstraints::build_stretch(const ClothMesh& mesh, float stiffness)
@@ -21,18 +21,42 @@ void SimConstraints::build_stretch(const ClothMesh& mesh, float stiffness)
            num_tris, stiffness);
 }
 
+// ============================================================================
+// CPU build: cotangent-weighted bend (Discrete Shells / DiffCloth)
+//
+// For each inner edge (v0,v1) shared by triangles (v0,v1,v2) and (v0,v1,v3):
+//
+//   Cotangent weights in triangle 0 (v0,v1,v2):
+//     A0         = area (Heron's formula from l01, l02, l12)
+//     cot02      = cot(angle at v1) = (l01² + l12² - l02²) / (4·A0)
+//     cot12      = cot(angle at v0) = (l01² + l02² - l12²) / (4·A0)
+//   Cotangent weights in triangle 1 (v0,v1,v3):
+//     A1         = area (Heron's formula from l01, l03, l13)
+//     cot03      = cot(angle at v1) = (l01² + l13² - l03²) / (4·A1)
+//     cot13      = cot(angle at v0) = (l01² + l03² - l13²) / (4·A1)
+//
+//   Vertex weights:
+//     w0 =  cot02 + cot03    (v0: shared edge)
+//     w1 =  cot12 + cot13    (v1: shared edge)
+//     w2 = -(cot02 + cot12)  (v2: wing)
+//     w3 = -(cot03 + cot13)  (v3: wing)
+//
+//   Rest curvature norm:
+//     n_rest = |w0·X0 + w1·X1 + w2·X2 + w3·X3|  (≈ 0 for flat rest mesh)
+// ============================================================================
+
 void SimConstraints::build_bend(const ClothMesh& mesh,
                                 const MeshTopology& topo,
                                 float stiffness)
 {
     bend_quads.clear();
-    bend_rest_angles.clear();
+    bend_w.clear();
+    bend_n.clear();
     bend_stiffness.clear();
 
     for (const auto& et : topo.edges) {
         if (et.tri_b == -1) continue;  // boundary edge: no bend
 
-        // Find the vertex opposite to this edge in each adjacent triangle
         auto find_opp = [&](int tri, int v0, int v1) -> int {
             for (int i = 0; i < 3; ++i) {
                 int v = mesh.triangles[tri](i);
@@ -44,42 +68,61 @@ void SimConstraints::build_bend(const ClothMesh& mesh,
         const int v3 = find_opp(et.tri_b, et.v0, et.v1);
         if (v2 == -1 || v3 == -1) continue;
 
-        // Compute rest dihedral angle using the wing-vector convention that
-        // matches bend_project_kernel: angle between the perpendicular components
-        // of v2 and v3 relative to the shared edge axis.
-        const Eigen::Vector3f& p0 = mesh.rest_pos[et.v0];
-        const Eigen::Vector3f& p1 = mesh.rest_pos[et.v1];
-        const Eigen::Vector3f& p2 = mesh.rest_pos[v2];
-        const Eigen::Vector3f& p3 = mesh.rest_pos[v3];
+        const Eigen::Vector3f& X0 = mesh.rest_pos[et.v0];
+        const Eigen::Vector3f& X1 = mesh.rest_pos[et.v1];
+        const Eigen::Vector3f& X2 = mesh.rest_pos[v2];
+        const Eigen::Vector3f& X3 = mesh.rest_pos[v3];
 
-        Eigen::Vector3f edge = p1 - p0;
-        const float edge_len = edge.norm();
-        if (edge_len < 1e-10f) continue;
-        Eigen::Vector3f ax = edge / edge_len;
+        // Edge lengths in rest pose
+        const float l01 = (X1 - X0).norm();
+        const float l02 = (X2 - X0).norm();
+        const float l03 = (X3 - X0).norm();
+        const float l12 = (X2 - X1).norm();
+        const float l13 = (X3 - X1).norm();
 
-        auto wing = [&](const Eigen::Vector3f& p) -> Eigen::Vector3f {
-            const float t = (p - p0).dot(ax);
-            return (p - p0) - t * ax;
+        // Triangle areas via Heron's formula
+        auto heron = [](float a, float b, float c) -> float {
+            const float s = 0.5f * (a + b + c);
+            const float v = s * (s-a) * (s-b) * (s-c);
+            return (v > 0.0f) ? std::sqrt(v) : 0.0f;
         };
-        Eigen::Vector3f r2 = wing(p2);
-        Eigen::Vector3f r3 = wing(p3);
-        const float r2_len = r2.norm(), r3_len = r3.norm();
-        if (r2_len < 1e-10f || r3_len < 1e-10f) continue;
+        const float A0 = heron(l01, l02, l12);  // tri(v0,v1,v2)
+        const float A1 = heron(l01, l03, l13);  // tri(v0,v1,v3)
 
-        const Eigen::Vector3f r2h = r2 / r2_len;
-        const Eigen::Vector3f r3h = r3 / r3_len;
+        if (A0 < 1e-10f || A1 < 1e-10f) continue;  // degenerate triangle
 
-        const float cos_t = std::clamp(r2h.dot(r3h), -1.0f, 1.0f);
-        const float sin_t = r2h.cross(r3h).dot(ax);
-        const float rest_angle = std::atan2(sin_t, cos_t);
+        // Cotangent weights (law of cosines)
+        // cot(angle_at_v1_in_tri0): opposite edge = l02
+        const float cot02 = (l01*l01 + l12*l12 - l02*l02) / (4.0f * A0);
+        // cot(angle_at_v0_in_tri0): opposite edge = l12
+        const float cot12 = (l01*l01 + l02*l02 - l12*l12) / (4.0f * A0);
+        // cot(angle_at_v1_in_tri1): opposite edge = l03
+        const float cot03 = (l01*l01 + l13*l13 - l03*l03) / (4.0f * A1);
+        // cot(angle_at_v0_in_tri1): opposite edge = l13
+        const float cot13 = (l01*l01 + l03*l03 - l13*l13) / (4.0f * A1);
+
+        const float w0 =   cot02 + cot03;
+        const float w1 =   cot12 + cot13;
+        const float w2 = -(cot02 + cot12);
+        const float w3 = -(cot03 + cot13);
+
+        // Rest curvature vector and its norm
+        const Eigen::Vector3f e_rest = w0*X0 + w1*X1 + w2*X2 + w3*X3;
+        const float n_rest = e_rest.norm();
+        // n_rest ≈ 0 for flat cloth (discrete curvature is zero at rest)
+        // When n_rest = 0, the projection drives current curvature → 0 (flatten)
 
         bend_quads.emplace_back(et.v0, et.v1, v2, v3);
-        bend_rest_angles.push_back(rest_angle);
+        bend_w.push_back(w0);
+        bend_w.push_back(w1);
+        bend_w.push_back(w2);
+        bend_w.push_back(w3);
+        bend_n.push_back(n_rest);
         bend_stiffness.push_back(stiffness);
     }
 
     num_bend_cons = static_cast<int>(bend_quads.size());
-    printf("  SimConstraints: %d bend constraints (stiffness=%.4f)\n",
+    printf("  SimConstraints: %d bend constraints (cotangent, stiffness=%.4f)\n",
            num_bend_cons, stiffness);
 }
 
@@ -89,56 +132,48 @@ void SimConstraints::build_bend(const ClothMesh& mesh,
 
 void SimConstraints::precompute_jacobi_diag(const ClothMesh& mesh, float dt)
 {
-    // System diagonal: diag_i = m_i + h² * Σ_{c∋i} w_c
+    // diag_i = m_i + h² · Σ_{c∋i} (effective weight)²
     //
-    // Triangle stretch (Stiefel projection) contribution per triangle t with
-    // vertices (v0, v1, v2) and Dm_inv G = [[g00, g01], [g10, g11]]:
-    //   diag[v0] += h² * wA * ((g00+g10)² + (g01+g11)²)
-    //   diag[v1] += h² * wA * (g00² + g01²)
-    //   diag[v2] += h² * wA * (g10² + g11²)
-    // where wA = stiffness * rest_area.
+    // Triangle stretch  (Stiefel projection, F = Ds · G, G = Dm_inv):
+    //   diag[v0] += h² · wA · ((g00+g10)² + (g01+g11)²)
+    //   diag[v1] += h² · wA · (g00² + g01²)
+    //   diag[v2] += h² · wA · (g10² + g11²)
+    //   where wA = stretch_k[t] · rest_area[t]
     //
-    // Bend contribution (v2/v3 wing vertices only — v0/v1 project to current
-    // position so they must NOT contribute to the diagonal):
-    //   diag[v2] += h² * bend_k
-    //   diag[v3] += h² * bend_k
+    // Cotangent bend:
+    //   diag[v_i] += h² · bend_k · w_i²
+    //   (w_i are the cotangent weights, possibly negative; squared → positive)
 
-    const int N  = mesh.num_verts;
+    const int N   = mesh.num_verts;
     const float h2 = dt * dt;
 
     std::vector<float> diag(N, 0.0f);
 
-    // Mass contribution
-    for (int i = 0; i < N; ++i)
-        diag[i] = mesh.mass[i];
+    // Mass
+    for (int i = 0; i < N; ++i) diag[i] = mesh.mass[i];
 
-    // Triangle stretch contribution
+    // Triangle stretch
     for (int t = 0; t < mesh.num_tris; ++t) {
         if (t >= (int)tri_stretch_k.size()) break;
         const int v0 = mesh.triangles[t](0);
         const int v1 = mesh.triangles[t](1);
         const int v2 = mesh.triangles[t](2);
         const float wA = tri_stretch_k[t] * mesh.rest_area[t];
-
-        // Dm_inv stored col-major: M(row,col)
-        const float g00 = mesh.Dm_inv[t](0, 0);
-        const float g10 = mesh.Dm_inv[t](1, 0);
-        const float g01 = mesh.Dm_inv[t](0, 1);
-        const float g11 = mesh.Dm_inv[t](1, 1);
-
-        const float s0 = g00 + g10;
-        const float s1 = g01 + g11;
-        diag[v0] += h2 * wA * (s0 * s0 + s1 * s1);
-        diag[v1] += h2 * wA * (g00 * g00 + g01 * g01);
-        diag[v2] += h2 * wA * (g10 * g10 + g11 * g11);
+        const float g00 = mesh.Dm_inv[t](0, 0), g10 = mesh.Dm_inv[t](1, 0);
+        const float g01 = mesh.Dm_inv[t](0, 1), g11 = mesh.Dm_inv[t](1, 1);
+        const float s0  = g00 + g10, s1 = g01 + g11;
+        diag[v0] += h2 * wA * (s0*s0 + s1*s1);
+        diag[v1] += h2 * wA * (g00*g00 + g01*g01);
+        diag[v2] += h2 * wA * (g10*g10 + g11*g11);
     }
 
-    // Bend contribution (wing vertices only)
+    // Cotangent bend: w_i² contribution per vertex
     for (int e = 0; e < num_bend_cons; ++e) {
-        const float w = bend_stiffness[e];
-        if (w == 0.0f) continue;
-        diag[bend_quads[e](2)] += h2 * w;  // v2
-        diag[bend_quads[e](3)] += h2 * w;  // v3
+        const float k = bend_stiffness[e];
+        for (int i = 0; i < 4; ++i) {
+            const float wi = bend_w[e*4 + i];
+            diag[bend_quads[e](i)] += h2 * k * wi * wi;
+        }
     }
 
 #ifdef CUDA_MS_HAVE_CUDA
@@ -162,24 +197,25 @@ void SimConstraints::upload_to_gpu()
         cudaMemcpy(*dst, src, bytes, cudaMemcpyHostToDevice);
     };
 
-    if (!tri_stretch_k.empty()) {
+    if (!tri_stretch_k.empty())
         alloc_copy((void**)&d_tri_stretch_k,
                    tri_stretch_k.data(), num_tris * sizeof(float));
-    }
 
-    // d_jacobi_diag is uploaded by precompute_jacobi_diag(), not here.
+    // d_jacobi_diag is handled by precompute_jacobi_diag(), not here.
 
     if (num_bend_cons > 0) {
         std::vector<int> h_quads(num_bend_cons * 4);
         for (int i = 0; i < num_bend_cons; ++i) {
-            h_quads[i * 4 + 0] = bend_quads[i](0);
-            h_quads[i * 4 + 1] = bend_quads[i](1);
-            h_quads[i * 4 + 2] = bend_quads[i](2);
-            h_quads[i * 4 + 3] = bend_quads[i](3);
+            h_quads[i*4+0] = bend_quads[i](0);
+            h_quads[i*4+1] = bend_quads[i](1);
+            h_quads[i*4+2] = bend_quads[i](2);
+            h_quads[i*4+3] = bend_quads[i](3);
         }
         alloc_copy((void**)&d_bend_quads, h_quads.data(),
                    num_bend_cons * 4 * sizeof(int));
-        alloc_copy((void**)&d_bend_rest, bend_rest_angles.data(),
+        alloc_copy((void**)&d_bend_w, bend_w.data(),
+                   num_bend_cons * 4 * sizeof(float));
+        alloc_copy((void**)&d_bend_n, bend_n.data(),
                    num_bend_cons * sizeof(float));
         alloc_copy((void**)&d_bend_k, bend_stiffness.data(),
                    num_bend_cons * sizeof(float));
@@ -192,11 +228,12 @@ void SimConstraints::upload_to_gpu()
 void SimConstraints::free_gpu()
 {
 #ifdef CUDA_MS_HAVE_CUDA
-    auto safe_free = [](void* p) { if (p) cudaFree(p); };
-    safe_free(d_tri_stretch_k); d_tri_stretch_k = nullptr;
-    safe_free(d_jacobi_diag);   d_jacobi_diag   = nullptr;
-    safe_free(d_bend_quads);    d_bend_quads     = nullptr;
-    safe_free(d_bend_rest);     d_bend_rest      = nullptr;
-    safe_free(d_bend_k);        d_bend_k         = nullptr;
+    auto sf = [](void* p) { if (p) cudaFree(p); };
+    sf(d_tri_stretch_k); d_tri_stretch_k = nullptr;
+    sf(d_jacobi_diag);   d_jacobi_diag   = nullptr;
+    sf(d_bend_quads);    d_bend_quads     = nullptr;
+    sf(d_bend_w);        d_bend_w         = nullptr;
+    sf(d_bend_n);        d_bend_n         = nullptr;
+    sf(d_bend_k);        d_bend_k         = nullptr;
 #endif
 }

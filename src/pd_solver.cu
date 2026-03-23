@@ -21,17 +21,19 @@ __global__ void predict_kernel(
 {
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= N) return;
-
     const float h2g = dt * dt * gravity;
-    predict[idx * 3 + 0] = pos[idx * 3 + 0] + dt * vel[idx * 3 + 0];
-    predict[idx * 3 + 1] = pos[idx * 3 + 1] + dt * vel[idx * 3 + 1] + h2g;
-    predict[idx * 3 + 2] = pos[idx * 3 + 2] + dt * vel[idx * 3 + 2];
+    predict[idx*3+0] = pos[idx*3+0] + dt * vel[idx*3+0];
+    predict[idx*3+1] = pos[idx*3+1] + dt * vel[idx*3+1] + h2g;
+    predict[idx*3+2] = pos[idx*3+2] + dt * vel[idx*3+2];
 }
 
-// Triangle stretch: project deformation gradient F onto Stiefel manifold (nearest rotation R).
-// F = Ds * Dm_inv,  Ds = [x1-x0, x2-x0]  (columns, 3×2)
-// R = U * V^T  via analytic SVD of F^T * F (2×2 symmetric)
+// ============================================================================
+// Stretch: Stiefel manifold projection (nearest rotation)
+// F = Ds · Dm_inv,  Ds = [x1-x0, x2-x0]  (3×2)
+// R = U · V^T via analytic SVD of F^T·F (2×2 symmetric)
 // Output: proj[t*6 + 0..2] = R[:,0],  proj[t*6 + 3..5] = R[:,1]
+// ============================================================================
+
 __global__ void tri_stretch_project_kernel(
     const float* __restrict__ pos,     // [N*3]
     const int*   __restrict__ tris,    // [T*3]
@@ -42,10 +44,7 @@ __global__ void tri_stretch_project_kernel(
     const int t = blockIdx.x * blockDim.x + threadIdx.x;
     if (t >= num_tris) return;
 
-    const int v0 = tris[t * 3 + 0];
-    const int v1 = tris[t * 3 + 1];
-    const int v2 = tris[t * 3 + 2];
-
+    const int v0 = tris[t*3+0], v1 = tris[t*3+1], v2 = tris[t*3+2];
     const float3 p0 = make_float3(pos[v0*3+0], pos[v0*3+1], pos[v0*3+2]);
     const float3 p1 = make_float3(pos[v1*3+0], pos[v1*3+1], pos[v1*3+2]);
     const float3 p2 = make_float3(pos[v2*3+0], pos[v2*3+1], pos[v2*3+2]);
@@ -74,19 +73,17 @@ __global__ void tri_stretch_project_kernel(
     // Analytic eigendecomposition of 2×2 symmetric A
     const float tr   = (A00 + A11) * 0.5f;
     const float disc = sqrtf(fmaxf(0.0f, (A00 - A11)*(A00 - A11)*0.25f + A01*A01));
-    const float lam1 = tr + disc;
-    const float lam2 = tr - disc;
+    const float lam1 = tr + disc, lam2 = tr - disc;
 
     float v1x, v1y;
-    if (disc < 1e-10f) {
-        v1x = 1.0f; v1y = 0.0f;
-    } else {
+    if (disc < 1e-10f) { v1x = 1.0f; v1y = 0.0f; }
+    else {
         const float tmp = lam1 - A00;
         const float len = sqrtf(A01*A01 + tmp*tmp);
         if (len > 1e-10f) { v1x = A01/len; v1y = tmp/len; }
         else               { v1x = 1.0f;   v1y = 0.0f;   }
     }
-    const float v2x = -v1y, v2y = v1x;  // perpendicular
+    const float v2x = -v1y, v2y = v1x;
 
     const float sig1 = sqrtf(fmaxf(0.0f, lam1));
     const float sig2 = sqrtf(fmaxf(0.0f, lam2));
@@ -100,13 +97,11 @@ __global__ void tri_stretch_project_kernel(
     } else {
         u1 = make_float3(1.0f, 0.0f, 0.0f);
     }
-
     if (sig2 > EPS) {
         u2 = make_float3((F0.x*v2x + F1.x*v2y) / sig2,
                           (F0.y*v2x + F1.y*v2y) / sig2,
                           (F0.z*v2x + F1.z*v2y) / sig2);
     } else {
-        // Gram-Schmidt against u1
         const float dot = u1.x*(F0.x*v2x + F1.x*v2y)
                         + u1.y*(F0.y*v2x + F1.y*v2y)
                         + u1.z*(F0.z*v2x + F1.z*v2y);
@@ -114,17 +109,15 @@ __global__ void tri_stretch_project_kernel(
                                   (F0.y*v2x + F1.y*v2y) - dot*u1.y,
                                   (F0.z*v2x + F1.z*v2y) - dot*u1.z);
         const float len = sqrtf(tmp.x*tmp.x + tmp.y*tmp.y + tmp.z*tmp.z);
-        if (len > EPS) {
-            u2 = make_float3(tmp.x/len, tmp.y/len, tmp.z/len);
-        } else {
+        if (len > EPS) { u2 = make_float3(tmp.x/len, tmp.y/len, tmp.z/len); }
+        else {
             u2 = make_float3(-u1.y, u1.x, 0.0f);
             if (fabsf(u2.x) < EPS && fabsf(u2.y) < EPS)
                 u2 = make_float3(0.0f, 1.0f, 0.0f);
         }
     }
 
-    // R = U * V^T:  R[:,0] = u1*v1x + u2*v2x,  R[:,1] = u1*v1y + u2*v2y
-    // v2 = [-v1y, v1x], so v2x = -v1y, v2y = v1x
+    // R = U * V^T:  v2 = [-v1y, v1x]
     const float3 R0 = make_float3(u1.x*v1x + u2.x*(-v1y),
                                    u1.y*v1x + u2.y*(-v1y),
                                    u1.z*v1x + u2.z*(-v1y));
@@ -137,17 +130,17 @@ __global__ void tri_stretch_project_kernel(
 }
 
 // Accumulate triangle stretch RHS contributions.
-// With Ds = [x1-x0, x2-x0] and F = Ds * G, projecting F → R gives RHS:
+// F = Ds * G, projection F → R.  RHS per vertex (derived from ∂||F-R||²/∂x_i = 0):
 //   v0: -wA * ((g00+g10)*R0 + (g01+g11)*R1)
 //   v1:  wA * (g00*R0 + g01*R1)
 //   v2:  wA * (g10*R0 + g11*R1)
 __global__ void accumulate_tri_stretch_rhs_kernel(
-    const int*   __restrict__ tris,      // [T*3]
-    const float* __restrict__ Dm_inv,    // [T*4]
-    const float* __restrict__ rest_area, // [T]
-    const float* __restrict__ stretch_k, // [T]
+    const int*   __restrict__ tris,
+    const float* __restrict__ Dm_inv,
+    const float* __restrict__ rest_area,
+    const float* __restrict__ stretch_k,
     const float* __restrict__ proj,      // [T*6]
-    float*       __restrict__ rhs,       // [N*3]
+    float*       __restrict__ rhs,
     int num_tris, float h2)
 {
     const int t = blockIdx.x * blockDim.x + threadIdx.x;
@@ -174,106 +167,85 @@ __global__ void accumulate_tri_stretch_rhs_kernel(
     atomicAdd(&rhs[v2*3+0], c2.x); atomicAdd(&rhs[v2*3+1], c2.y); atomicAdd(&rhs[v2*3+2], c2.z);
 }
 
-// Bend constraint projection: rotate wing vertices so dihedral → rest_angle.
-// Quad: (v0,v1) = shared edge, v2/v3 = opposite vertices in the two triangles.
+// ============================================================================
+// Bend: cotangent-weighted quadratic bending (Discrete Shells / DiffCloth)
+//
+// Local step: compute e = Σ w_i · x_i  then  p = e/|e| · n_rest
+//   Output: one 3D projection vector per constraint (bend_proj[e] = p)
+//
+// Global step: rhs[v_i] += h² · k · w_i · p
+//   Jacobi diagonal (precomputed): diag[v_i] += h² · k · w_i²
+// ============================================================================
+
+// Local step: project discrete curvature vector onto sphere of rest radius.
+// Output: one float3 per constraint (the projected p vector).
 __global__ void bend_project_kernel(
-    const float* __restrict__ pos,          // [N*3]
-    const int*   __restrict__ quads,        // [E_bend*4]
-    const float* __restrict__ rest_angles,  // [E_bend]
-    float3*      __restrict__ projections,  // [E_bend*4] output
+    const float* __restrict__ pos,      // [N*3]
+    const int*   __restrict__ quads,    // [E_bend*4]  (v0,v1,v2,v3)
+    const float* __restrict__ weights,  // [E_bend*4]  cotangent weights
+    const float* __restrict__ n_rest,   // [E_bend]    rest curvature norms
+    float3*      __restrict__ proj_out, // [E_bend]    output projection
     int num_bends)
 {
     const int e = blockIdx.x * blockDim.x + threadIdx.x;
     if (e >= num_bends) return;
 
-    const int v0 = quads[e*4+0], v1 = quads[e*4+1];
-    const int v2 = quads[e*4+2], v3 = quads[e*4+3];
+    // Compute e = Σ w_i * x_i
+    float3 accum = make_float3(0.0f, 0.0f, 0.0f);
+    for (int i = 0; i < 4; ++i) {
+        const int   vi = quads[e*4+i];
+        const float wi = weights[e*4+i];
+        accum.x += wi * pos[vi*3+0];
+        accum.y += wi * pos[vi*3+1];
+        accum.z += wi * pos[vi*3+2];
+    }
 
-    const float3 p0 = make_float3(pos[v0*3], pos[v0*3+1], pos[v0*3+2]);
-    const float3 p1 = make_float3(pos[v1*3], pos[v1*3+1], pos[v1*3+2]);
-    const float3 p2 = make_float3(pos[v2*3], pos[v2*3+1], pos[v2*3+2]);
-    const float3 p3 = make_float3(pos[v3*3], pos[v3*3+1], pos[v3*3+2]);
+    // Project to sphere of radius n_rest:  p = accum / |accum| * n_rest
+    const float nr  = n_rest[e];
+    const float len = sqrtf(accum.x*accum.x + accum.y*accum.y + accum.z*accum.z);
+    float3 p;
+    if (len > 1e-10f && nr > 1e-10f) {
+        const float scale = nr / len;
+        p = make_float3(accum.x*scale, accum.y*scale, accum.z*scale);
+    } else {
+        // n_rest ≈ 0 (flat cloth): drive curvature to zero → p = 0
+        p = make_float3(0.0f, 0.0f, 0.0f);
+    }
 
-    // Default: no change
-    projections[e*4+0] = p0;
-    projections[e*4+1] = p1;
-    projections[e*4+2] = p2;
-    projections[e*4+3] = p3;
-
-    const float3 edge = {p1.x-p0.x, p1.y-p0.y, p1.z-p0.z};
-    const float edge_len = sqrtf(edge.x*edge.x + edge.y*edge.y + edge.z*edge.z);
-    if (edge_len < 1e-10f) return;
-    const float3 ax = {edge.x/edge_len, edge.y/edge_len, edge.z/edge_len};
-
-    auto perp_from_edge = [&](float3 p) -> float3 {
-        const float tval = (p.x-p0.x)*ax.x + (p.y-p0.y)*ax.y + (p.z-p0.z)*ax.z;
-        const float3 foot = {p0.x+tval*ax.x, p0.y+tval*ax.y, p0.z+tval*ax.z};
-        return {p.x-foot.x, p.y-foot.y, p.z-foot.z};
-    };
-
-    const float3 r2 = perp_from_edge(p2);
-    const float3 r3 = perp_from_edge(p3);
-    const float r2_len = sqrtf(r2.x*r2.x + r2.y*r2.y + r2.z*r2.z);
-    const float r3_len = sqrtf(r3.x*r3.x + r3.y*r3.y + r3.z*r3.z);
-    if (r2_len < 1e-10f || r3_len < 1e-10f) return;
-
-    const float3 r2h = {r2.x/r2_len, r2.y/r2_len, r2.z/r2_len};
-    const float3 r3h = {r3.x/r3_len, r3.y/r3_len, r3.z/r3_len};
-
-    const float cos_t = fmaxf(-1.0f, fminf(1.0f, r2h.x*r3h.x + r2h.y*r3h.y + r2h.z*r3h.z));
-    const float3 cr   = {r2h.y*r3h.z - r2h.z*r3h.y,
-                          r2h.z*r3h.x - r2h.x*r3h.z,
-                          r2h.x*r3h.y - r2h.y*r3h.x};
-    const float sin_t = cr.x*ax.x + cr.y*ax.y + cr.z*ax.z;
-    float diff = atan2f(sin_t, cos_t) - rest_angles[e];
-    if (diff >  3.14159265f) diff -= 6.28318530f;
-    if (diff < -3.14159265f) diff += 6.28318530f;
-
-    // Cap per-step correction at ±10° to keep Jacobi stable
-    const float MAX_HALF = 0.17453f;
-    const float half_d   = fmaxf(-MAX_HALF, fminf(MAX_HALF, diff * 0.5f));
-
-    auto rotate_perp = [&](float3 r, float angle) -> float3 {
-        const float ca = cosf(angle), sa = sinf(angle);
-        const float3 cr2 = {ax.y*r.z - ax.z*r.y,
-                             ax.z*r.x - ax.x*r.z,
-                             ax.x*r.y - ax.y*r.x};
-        return {ca*r.x + sa*cr2.x, ca*r.y + sa*cr2.y, ca*r.z + sa*cr2.z};
-    };
-
-    const float3 r2n = rotate_perp(r2, -half_d);
-    const float3 r3n = rotate_perp(r3,  half_d);
-
-    auto foot = [&](float3 p) -> float3 {
-        const float tval = (p.x-p0.x)*ax.x + (p.y-p0.y)*ax.y + (p.z-p0.z)*ax.z;
-        return {p0.x+tval*ax.x, p0.y+tval*ax.y, p0.z+tval*ax.z};
-    };
-    const float3 f2 = foot(p2), f3 = foot(p3);
-    projections[e*4+2] = {f2.x+r2n.x, f2.y+r2n.y, f2.z+r2n.z};
-    projections[e*4+3] = {f3.x+r3n.x, f3.y+r3n.y, f3.z+r3n.z};
+    proj_out[e] = p;
 }
 
-// Accumulate bend RHS (only wing vertices v2/v3).
-// v0/v1 project to current positions and must NOT contribute to Jacobi RHS.
+// Global step: accumulate bend RHS contributions.
+// rhs[v_i] += h² · k · w_i · p
+// All 4 vertices contribute (weights may be negative for wing vertices,
+// which correctly pulls them in the opposite direction of p).
 __global__ void accumulate_bend_rhs_kernel(
-    const int*    __restrict__ quads,
-    const float3* __restrict__ projections,
-    const float*  __restrict__ stiffness,
+    const int*    __restrict__ quads,      // [E_bend*4]
+    const float*  __restrict__ weights,    // [E_bend*4]
+    const float*  __restrict__ stiffness,  // [E_bend]
+    const float3* __restrict__ projections, // [E_bend]  one p per constraint
     float*        __restrict__ rhs,
     int num_bends, float h2)
 {
     const int e = blockIdx.x * blockDim.x + threadIdx.x;
     if (e >= num_bends) return;
 
-    const int v2 = quads[e*4+2], v3 = quads[e*4+3];
-    const float w = stiffness[e] * h2;
-    const float3 p2 = projections[e*4+2], p3 = projections[e*4+3];
+    const float k = stiffness[e] * h2;
+    const float3 p = projections[e];
 
-    atomicAdd(&rhs[v2*3+0], w*p2.x); atomicAdd(&rhs[v2*3+1], w*p2.y); atomicAdd(&rhs[v2*3+2], w*p2.z);
-    atomicAdd(&rhs[v3*3+0], w*p3.x); atomicAdd(&rhs[v3*3+1], w*p3.y); atomicAdd(&rhs[v3*3+2], w*p3.z);
+    for (int i = 0; i < 4; ++i) {
+        const int   vi = quads[e*4+i];
+        const float wi = weights[e*4+i];
+        atomicAdd(&rhs[vi*3+0], k * wi * p.x);
+        atomicAdd(&rhs[vi*3+1], k * wi * p.y);
+        atomicAdd(&rhs[vi*3+2], k * wi * p.z);
+    }
 }
 
-// Clear RHS accumulator
+// ============================================================================
+// Utility kernels
+// ============================================================================
+
 __global__ void clear_rhs_kernel(float* rhs, int N)
 {
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -281,7 +253,6 @@ __global__ void clear_rhs_kernel(float* rhs, int N)
     rhs[idx*3+0] = 0.0f; rhs[idx*3+1] = 0.0f; rhs[idx*3+2] = 0.0f;
 }
 
-// Add inertial term: rhs += M * predict
 __global__ void add_inertial_rhs_kernel(
     float*       __restrict__ rhs,
     const float* __restrict__ mass,
@@ -296,7 +267,6 @@ __global__ void add_inertial_rhs_kernel(
     atomicAdd(&rhs[idx*3+2], m * predict[idx*3+2]);
 }
 
-// Jacobi division: x_new = rhs / jacobi_diag
 __global__ void jacobi_divide_kernel(
     float*       __restrict__ new_pos,
     const float* __restrict__ rhs,
@@ -312,7 +282,6 @@ __global__ void jacobi_divide_kernel(
     new_pos[idx*3+2] = rhs[idx*3+2] * inv;
 }
 
-// Velocity update: v = (x_new - x_old) / dt * (1 - damping)
 __global__ void update_velocity_kernel(
     const float* __restrict__ old_pos,
     float*       __restrict__ vel,
@@ -327,7 +296,6 @@ __global__ void update_velocity_kernel(
     vel[idx*3+2] = (new_pos[idx*3+2] - old_pos[idx*3+2]) * scale;
 }
 
-// Apply pinned constraints: overwrite pos and zero vel
 __global__ void apply_constraints_kernel(
     float*       __restrict__ pos,
     float*       __restrict__ vel,
@@ -341,9 +309,7 @@ __global__ void apply_constraints_kernel(
     pos[idx*3+0] = target_pos[i*3+0];
     pos[idx*3+1] = target_pos[i*3+1];
     pos[idx*3+2] = target_pos[i*3+2];
-    vel[idx*3+0] = 0.0f;
-    vel[idx*3+1] = 0.0f;
-    vel[idx*3+2] = 0.0f;
+    vel[idx*3+0] = 0.0f; vel[idx*3+1] = 0.0f; vel[idx*3+2] = 0.0f;
 }
 
 // ============================================================================
@@ -376,41 +342,33 @@ PDSolver::PDSolver(const PDSolverConfig& config,
     allocate_buffers(num_verts_, num_tris_, num_bend_cons_);
 }
 
-PDSolver::~PDSolver()
-{
-    free_buffers();
-}
+PDSolver::~PDSolver() { free_buffers(); }
 
 void PDSolver::allocate_buffers(int N, int T, int E_bend)
 {
-    cudaMalloc((void**)&d_predict_, N * 3 * sizeof(float));
-    cudaMalloc((void**)&d_rhs_,     N * 3 * sizeof(float));
+    cudaMalloc((void**)&d_predict_,  N * 3 * sizeof(float));
+    cudaMalloc((void**)&d_rhs_,      N * 3 * sizeof(float));
     cudaMalloc((void**)&d_prev_pos_, N * 3 * sizeof(float));
     cudaMemset(d_prev_pos_, 0, N * 3 * sizeof(float));
-    cudaMalloc((void**)&d_new_pos_, N * 3 * sizeof(float));
+    cudaMalloc((void**)&d_new_pos_,  N * 3 * sizeof(float));
 
     if (T > 0)
         cudaMalloc((void**)&d_tri_stretch_proj_, T * 6 * sizeof(float));
     if (E_bend > 0)
-        cudaMalloc((void**)&d_bend_proj_, E_bend * 4 * sizeof(float3));
+        // One float3 projection per constraint (not per vertex as in old code)
+        cudaMalloc((void**)&d_bend_proj_, E_bend * sizeof(float3));
 }
 
 void PDSolver::free_buffers()
 {
     auto sf = [](float*& p) { if (p) { cudaFree(p); p = nullptr; } };
-    sf(d_predict_);
-    sf(d_rhs_);
-    sf(d_prev_pos_);
-    sf(d_new_pos_);
-    sf(d_tri_stretch_proj_);
-    sf(d_bend_proj_);
+    sf(d_predict_); sf(d_rhs_); sf(d_prev_pos_); sf(d_new_pos_);
+    sf(d_tri_stretch_proj_); sf(d_bend_proj_);
 }
 
 void PDSolver::reset()
 {
-    omega_prev_ = 1.0f;
-    omega_curr_ = 1.0f;
-    iter_count_ = 0;
+    omega_prev_ = 1.0f; omega_curr_ = 1.0f; iter_count_ = 0;
 }
 
 void PDSolver::step(ClothMesh& mesh,
@@ -428,7 +386,7 @@ void PDSolver::step(ClothMesh& mesh,
     CUDA_CHECK(cudaMemcpy(d_prev_pos_, mesh.d_pos, N * 3 * sizeof(float),
                           cudaMemcpyDeviceToDevice));
 
-    // --- Predict: y = x + h*v + h²*g ---
+    // Step 1: Predict  y = x + h*v + h²*g
     {
         const int nb = (N + BLK - 1) / BLK;
         predict_kernel<<<nb, BLK>>>(mesh.d_pos, mesh.d_vel, d_predict_,
@@ -436,12 +394,15 @@ void PDSolver::step(ClothMesh& mesh,
         CUDA_CHECK(cudaGetLastError());
     }
 
-    // --- Local-Global iterations (Jacobi ping-pong) ---
+    // Steps 2: Local–Global Jacobi iterations
     float* d_in  = mesh.d_pos;
     float* d_out = d_new_pos_;
 
     for (int iter = 0; iter < config_.max_iterations; ++iter) {
-        // Local step: stretch
+
+        // ---- Local step ----
+
+        // Triangle stretch projection: F → R (nearest rotation)
         if (T > 0 && sim_cons.d_tri_stretch_k) {
             const int nb = (T + BLK - 1) / BLK;
             tri_stretch_project_kernel<<<nb, BLK>>>(
@@ -449,23 +410,27 @@ void PDSolver::step(ClothMesh& mesh,
             CUDA_CHECK(cudaGetLastError());
         }
 
-        // Local step: bend
+        // Bend projection: e = Σ w_i x_i  →  p = e/|e| · n_rest
         if (Eb > 0 && d_bend_proj_ && sim_cons.d_bend_quads) {
             const int nb = (Eb + BLK - 1) / BLK;
             bend_project_kernel<<<nb, BLK>>>(
-                d_in, sim_cons.d_bend_quads, sim_cons.d_bend_rest,
-                reinterpret_cast<float3*>(d_bend_proj_), Eb);
+                d_in,
+                sim_cons.d_bend_quads,
+                sim_cons.d_bend_w,
+                sim_cons.d_bend_n,
+                reinterpret_cast<float3*>(d_bend_proj_),
+                Eb);
             CUDA_CHECK(cudaGetLastError());
         }
 
-        // Global step: clear RHS
-        {
-            const int nb = (N + BLK - 1) / BLK;
-            clear_rhs_kernel<<<nb, BLK>>>(d_rhs_, N);
-            CUDA_CHECK(cudaGetLastError());
-        }
+        // ---- Global step: build RHS ----
 
-        // Global step: accumulate stretch
+        // Clear
+        { const int nb = (N + BLK - 1) / BLK;
+          clear_rhs_kernel<<<nb, BLK>>>(d_rhs_, N);
+          CUDA_CHECK(cudaGetLastError()); }
+
+        // Stretch: rhs[vi] += h² · wA · (G^T R)_i
         if (T > 0 && sim_cons.d_tri_stretch_k) {
             const int nb = (T + BLK - 1) / BLK;
             accumulate_tri_stretch_rhs_kernel<<<nb, BLK>>>(
@@ -475,34 +440,29 @@ void PDSolver::step(ClothMesh& mesh,
             CUDA_CHECK(cudaGetLastError());
         }
 
-        // Global step: accumulate bend
+        // Bend: rhs[vi] += h² · k · w_i · p
         if (Eb > 0 && d_bend_proj_ && sim_cons.d_bend_quads) {
             const int nb = (Eb + BLK - 1) / BLK;
             accumulate_bend_rhs_kernel<<<nb, BLK>>>(
                 sim_cons.d_bend_quads,
-                reinterpret_cast<const float3*>(d_bend_proj_),
+                sim_cons.d_bend_w,
                 sim_cons.d_bend_k,
+                reinterpret_cast<const float3*>(d_bend_proj_),
                 d_rhs_, Eb, h2);
             CUDA_CHECK(cudaGetLastError());
         }
 
-        // Global step: add inertial term M*y
-        {
-            const int nb = (N + BLK - 1) / BLK;
-            add_inertial_rhs_kernel<<<nb, BLK>>>(
-                d_rhs_, mesh.d_mass, d_predict_, N);
-            CUDA_CHECK(cudaGetLastError());
-        }
+        // Inertial: rhs += M · y
+        { const int nb = (N + BLK - 1) / BLK;
+          add_inertial_rhs_kernel<<<nb, BLK>>>(d_rhs_, mesh.d_mass, d_predict_, N);
+          CUDA_CHECK(cudaGetLastError()); }
 
-        // Global step: x_new = rhs / diag
-        {
-            const int nb = (N + BLK - 1) / BLK;
-            jacobi_divide_kernel<<<nb, BLK>>>(
-                d_out, d_rhs_, sim_cons.d_jacobi_diag, N);
-            CUDA_CHECK(cudaGetLastError());
-        }
+        // Jacobi: x_new = rhs / diag
+        { const int nb = (N + BLK - 1) / BLK;
+          jacobi_divide_kernel<<<nb, BLK>>>(d_out, d_rhs_, sim_cons.d_jacobi_diag, N);
+          CUDA_CHECK(cudaGetLastError()); }
 
-        // Apply pinned constraints
+        // Pinned constraints
         if (pin_cons.num_pinned > 0) {
             const int nb = (pin_cons.num_pinned + BLK - 1) / BLK;
             apply_constraints_kernel<<<nb, BLK>>>(
@@ -519,21 +479,18 @@ void PDSolver::step(ClothMesh& mesh,
         std::swap(d_in, d_out);
     }
 
-    // Ensure final positions are in mesh.d_pos
-    if (d_in != mesh.d_pos) {
+    // Ensure final result is in mesh.d_pos
+    if (d_in != mesh.d_pos)
         CUDA_CHECK(cudaMemcpy(mesh.d_pos, d_in, N * 3 * sizeof(float),
                               cudaMemcpyDeviceToDevice));
-    }
 
-    // Velocity: v = (x_new - x_old) / dt
-    {
-        const int nb = (N + BLK - 1) / BLK;
-        update_velocity_kernel<<<nb, BLK>>>(
-            d_prev_pos_, mesh.d_vel, mesh.d_pos, N, dt, config_.damping);
-        CUDA_CHECK(cudaGetLastError());
-    }
+    // Step 3: Velocity update  v = (x_new - x_old) / dt
+    { const int nb = (N + BLK - 1) / BLK;
+      update_velocity_kernel<<<nb, BLK>>>(
+          d_prev_pos_, mesh.d_vel, mesh.d_pos, N, dt, config_.damping);
+      CUDA_CHECK(cudaGetLastError()); }
 
-    // Re-enforce pinned constraints on final position/velocity
+    // Re-enforce pinned constraints on velocity
     if (pin_cons.num_pinned > 0) {
         const int nb = (pin_cons.num_pinned + BLK - 1) / BLK;
         apply_constraints_kernel<<<nb, BLK>>>(
@@ -548,18 +505,15 @@ void PDSolver::step(ClothMesh& mesh,
 
 void PDSolver::chebyshev_accelerate(float* /*d_pos*/, float* /*d_new_pos*/)
 {
-    // Update omega sequence
+    // Update omega sequence (Chebyshev semi-iterative method)
     if (iter_count_ == 0) {
-        omega_prev_ = 1.0f;
-        omega_curr_ = 1.0f;
+        omega_prev_ = 1.0f; omega_curr_ = 1.0f;
     } else if (iter_count_ == 1) {
-        const float rho2 = config_.rho * config_.rho;
-        omega_curr_ = 2.0f / (2.0f - rho2);
+        omega_curr_ = 2.0f / (2.0f - config_.rho * config_.rho);
     } else {
-        const float rho2 = config_.rho * config_.rho;
-        omega_curr_ = 4.0f / (4.0f - rho2 * omega_prev_);
+        omega_curr_ = 4.0f / (4.0f - config_.rho * config_.rho * omega_prev_);
     }
     omega_prev_ = omega_curr_;
-    // TODO Phase 4: apply x = omega*(x_jacobi - x_prev) + x_prev
-    //   Requires an additional d_cheby_prev_ buffer and a blend kernel.
+    // TODO Phase 4: apply blend  x = omega*(x_jacobi - x_prev) + x_prev
+    //   Requires d_cheby_prev_ [N*3] buffer + blend kernel.
 }
