@@ -501,15 +501,19 @@ __global__ void tri_stretch_project_kernel(
     }
 
     // R = U * V^T = [u1, u2] * [v1, v2]^T = u1*v1^T + u2*v2^T
-    // R columns: R0 = u1*v1.x + u2*v2.x, R1 = u1*v1.y + u2*v2.y
+    // V^T rows are v1^T and v2^T, so:
+    //   R[:,0] = u1*v1x + u2*v2x
+    //   R[:,1] = u1*v1y + u2*v2y
+    // But v2 is perpendicular to v1: v2 = [-v1y, v1x]
+    // So: v2x = -v1y, v2y = v1x
     float3 R0 = make_float3(
-        u1.x*v1x + u2.x*v2x,
-        u1.y*v1x + u2.y*v2x,
-        u1.z*v1x + u2.z*v2x);
+        u1.x*v1x + u2.x*(-v1y),
+        u1.y*v1x + u2.y*(-v1y),
+        u1.z*v1x + u2.z*(-v1y));
     float3 R1 = make_float3(
-        u1.x*v1y + u2.x*v2y,
-        u1.y*v1y + u2.y*v2y,
-        u1.z*v1y + u2.z*v2y);
+        u1.x*v1y + u2.x*v1x,
+        u1.y*v1y + u2.y*v1x,
+        u1.z*v1y + u2.z*v1x);
 
     // Write output: proj[t*6 + 0..2] = R0, proj[t*6 + 3..5] = R1
     proj[t*6+0] = R0.x; proj[t*6+1] = R0.y; proj[t*6+2] = R0.z;
