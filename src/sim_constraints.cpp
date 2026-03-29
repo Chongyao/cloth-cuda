@@ -176,6 +176,14 @@ void SimConstraints::precompute_jacobi_diag(const ClothMesh& mesh, float dt)
         }
     }
 
+    // Diagnostic: print min/max diag
+    float min_diag = diag[0], max_diag = diag[0];
+    for (int i = 1; i < N; ++i) {
+        min_diag = std::min(min_diag, diag[i]);
+        max_diag = std::max(max_diag, diag[i]);
+    }
+    printf("  Jacobi diag: min=%.6e, max=%.6e (h2=%.6e)\n", min_diag, max_diag, h2);
+
 #ifdef CUDA_MS_HAVE_CUDA
     if (d_jacobi_diag) { cudaFree(d_jacobi_diag); d_jacobi_diag = nullptr; }
     cudaMalloc((void**)&d_jacobi_diag, N * sizeof(float));

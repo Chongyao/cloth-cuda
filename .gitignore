@@ -42,8 +42,10 @@ __pycache__/
 # Outputs
 output/
 frames/
+results/
 *.ply
 *.obj.tmp
+*.png
 
 # Nsight Compute/Graphics
 *.nsys-rep

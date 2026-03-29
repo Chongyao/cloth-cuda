@@ -5,6 +5,7 @@ struct PDSolverConfig {
     int   max_iterations     = 50;    // local-global iterations per frame
     float tolerance          = 1e-4f; // convergence tolerance (unused: Jacobi runs fixed iters)
     bool  use_chebyshev      = true;  // enable Chebyshev acceleration
+    bool  use_cpu_stretch_reference = false; // correctness-first CPU stretch backend
     float rho                = 0.9f;  // spectral radius estimate for Chebyshev
     float gravity            = -9.8f; // gravitational acceleration (m/s²)
     float dt                 = 0.01f; // time step
@@ -13,10 +14,12 @@ struct PDSolverConfig {
     float damping            = 0.0f;  // velocity damping (0 = none, 1 = full)
 };
 
-// Forward declarations
 struct ClothMesh;
 struct SimConstraints;
 struct Constraints;
+#ifndef __CUDACC__
+class CpuStretchReferenceSolver;
+#endif
 
 // GPU-based Projective Dynamics solver.
 //
@@ -52,6 +55,10 @@ private:
     float* d_new_pos_         = nullptr;  // [N*3] Jacobi ping-pong output
     float* d_tri_stretch_proj_ = nullptr; // [T*6] Stiefel projection R per triangle
     float* d_bend_proj_       = nullptr;  // [E_bend*4*3] bend projections
+
+#ifndef __CUDACC__
+    CpuStretchReferenceSolver* cpu_stretch_ref_ = nullptr;
+#endif
 
     // ---- Chebyshev state ----
     float omega_prev_  = 1.0f;

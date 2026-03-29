@@ -4,6 +4,7 @@
 #include "constraints.h"
 #include "mesh_generator.h"
 #include "pd_solver.h"
+#include "stretch_reference.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -16,7 +17,7 @@
 #endif
 
 // Export mesh positions to ASCII PLY
-static void export_ply(const ClothMesh& mesh, const char* filename)
+static void export_ply(const ClothMesh& mesh, const char* filename, bool use_cpu_ref = false)
 {
     FILE* fp = fopen(filename, "w");
     if (!fp) {
@@ -31,14 +32,25 @@ static void export_ply(const ClothMesh& mesh, const char* filename)
     fprintf(fp, "property list uchar int vertex_indices\nend_header\n");
 
     std::vector<float> h_pos(mesh.num_verts * 3);
+    if (use_cpu_ref) {
+        for (int i = 0; i < mesh.num_verts; ++i) {
+            h_pos[i*3+0] = mesh.pos_cpu[i](0);
+            h_pos[i*3+1] = mesh.pos_cpu[i](1);
+            h_pos[i*3+2] = mesh.pos_cpu[i](2);
+        }
+    }
 #ifdef CUDA_MS_HAVE_CUDA
-    cudaMemcpy(h_pos.data(), mesh.d_pos,
-               mesh.num_verts * 3 * sizeof(float), cudaMemcpyDeviceToHost);
+    else {
+        cudaMemcpy(h_pos.data(), mesh.d_pos,
+                   mesh.num_verts * 3 * sizeof(float), cudaMemcpyDeviceToHost);
+    }
 #else
-    for (int i = 0; i < mesh.num_verts; ++i) {
-        h_pos[i*3+0] = mesh.rest_pos[i](0);
-        h_pos[i*3+1] = mesh.rest_pos[i](1);
-        h_pos[i*3+2] = mesh.rest_pos[i](2);
+    else {
+        for (int i = 0; i < mesh.num_verts; ++i) {
+            h_pos[i*3+0] = mesh.rest_pos[i](0);
+            h_pos[i*3+1] = mesh.rest_pos[i](1);
+            h_pos[i*3+2] = mesh.rest_pos[i](2);
+        }
     }
 #endif
     for (int i = 0; i < mesh.num_verts; ++i)
@@ -49,22 +61,37 @@ static void export_ply(const ClothMesh& mesh, const char* filename)
 }
 
 // Compute total (kinetic + gravitational potential) energy
-static float compute_energy(const ClothMesh& mesh, const PDSolverConfig& cfg)
+static float compute_energy(const ClothMesh& mesh, const PDSolverConfig& cfg, bool use_cpu_ref = false)
 {
     std::vector<float> h_pos(mesh.num_verts * 3);
     std::vector<float> h_vel(mesh.num_verts * 3);
     std::vector<float> h_mass(mesh.num_verts);
+    if (use_cpu_ref) {
+        for (int i = 0; i < mesh.num_verts; ++i) {
+            h_pos[i*3+0] = mesh.pos_cpu[i](0);
+            h_pos[i*3+1] = mesh.pos_cpu[i](1);
+            h_pos[i*3+2] = mesh.pos_cpu[i](2);
+            h_vel[i*3+0] = mesh.vel_cpu[i](0);
+            h_vel[i*3+1] = mesh.vel_cpu[i](1);
+            h_vel[i*3+2] = mesh.vel_cpu[i](2);
+            h_mass[i] = mesh.mass[i];
+        }
+    }
 #ifdef CUDA_MS_HAVE_CUDA
-    cudaMemcpy(h_pos.data(),  mesh.d_pos,  mesh.num_verts * 3 * sizeof(float), cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_vel.data(),  mesh.d_vel,  mesh.num_verts * 3 * sizeof(float), cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_mass.data(), mesh.d_mass, mesh.num_verts     * sizeof(float), cudaMemcpyDeviceToHost);
+    else {
+        cudaMemcpy(h_pos.data(),  mesh.d_pos,  mesh.num_verts * 3 * sizeof(float), cudaMemcpyDeviceToHost);
+        cudaMemcpy(h_vel.data(),  mesh.d_vel,  mesh.num_verts * 3 * sizeof(float), cudaMemcpyDeviceToHost);
+        cudaMemcpy(h_mass.data(), mesh.d_mass, mesh.num_verts     * sizeof(float), cudaMemcpyDeviceToHost);
+    }
 #else
-    for (int i = 0; i < mesh.num_verts; ++i) {
-        h_pos[i*3+0] = mesh.rest_pos[i](0);
-        h_pos[i*3+1] = mesh.rest_pos[i](1);
-        h_pos[i*3+2] = mesh.rest_pos[i](2);
-        h_vel[i*3+0] = h_vel[i*3+1] = h_vel[i*3+2] = 0.0f;
-        h_mass[i] = mesh.mass[i];
+    else {
+        for (int i = 0; i < mesh.num_verts; ++i) {
+            h_pos[i*3+0] = mesh.rest_pos[i](0);
+            h_pos[i*3+1] = mesh.rest_pos[i](1);
+            h_pos[i*3+2] = mesh.rest_pos[i](2);
+            h_vel[i*3+0] = h_vel[i*3+1] = h_vel[i*3+2] = 0.0f;
+            h_mass[i] = mesh.mass[i];
+        }
     }
 #endif
     float kinetic = 0.0f, potential = 0.0f;
@@ -90,6 +117,7 @@ static void print_usage(const char* prog)
     fprintf(stderr, "  --type <n>       Mesh type 0-3           (default: 3)\n");
     fprintf(stderr, "  --gravity <g>    Gravitational accel     (default: -9.8)\n");
     fprintf(stderr, "  --damping <d>    Velocity damping 0-1    (default: 0)\n");
+    fprintf(stderr, "  --stretch-backend <b>  gpu-current | cpu-ref  (default: gpu-current)\n");
     fprintf(stderr, "  --export <dir>   Export PLY frames\n");
     fprintf(stderr, "  --verbose        Per-frame energy output\n");
 }
@@ -112,6 +140,7 @@ int main(int argc, char* argv[])
     int         mesh_type      = 3;
     float       gravity        = -9.8f;
     float       damping        = 0.0f;
+    std::string stretch_backend = "gpu-current";
     std::string export_dir;
     bool        verbose        = false;
 
@@ -126,6 +155,7 @@ int main(int argc, char* argv[])
         else if (a == "--type"      && i+1 < argc) mesh_type      = std::stoi(argv[++i]);
         else if (a == "--gravity"   && i+1 < argc) gravity        = std::stof(argv[++i]);
         else if (a == "--damping"   && i+1 < argc) damping        = std::stof(argv[++i]);
+        else if (a == "--stretch-backend" && i+1 < argc) stretch_backend = argv[++i];
         else if (a == "--export"    && i+1 < argc) export_dir     = argv[++i];
         else if (a == "--verbose")                 verbose        = true;
     }
@@ -133,8 +163,8 @@ int main(int argc, char* argv[])
     printf("=== PD Cloth Simulation ===\n");
     printf("Grid: %d x %d, size: %.4f, type: %d\n", nrows, ncols, size, mesh_type);
     printf("Steps: %d, dt: %.4f, iter: %d\n", steps, dt, iterations);
-    printf("stiffness: %.3f, bend: %.4f, damping: %.3f, pin: %s\n",
-           stiffness, bend_stiffness, damping, pin_mode.c_str());
+    printf("stiffness: %.3f, bend: %.4f, damping: %.3f, pin: %s, backend: %s\n",
+           stiffness, bend_stiffness, damping, pin_mode.c_str(), stretch_backend.c_str());
 
     // ---- Build mesh ----
     ClothMesh mesh;
@@ -162,11 +192,15 @@ int main(int argc, char* argv[])
         pin_cons.pin_corners(mesh, ncols);
     printf("Pinned vertices: %d\n", (int)pin_cons.pinned_indices.size());
 
-    // ---- Upload to GPU ----
+    // ---- Upload / init runtime state ----
     mesh.upload_to_gpu();
-    sim_cons.upload_to_gpu();
-    sim_cons.precompute_jacobi_diag(mesh, dt);
     pin_cons.upload_to_gpu();
+
+    const bool use_cpu_ref = (stretch_backend == "cpu-ref");
+    if (!use_cpu_ref) {
+        sim_cons.upload_to_gpu();
+        sim_cons.precompute_jacobi_diag(mesh, dt);
+    }
 
     // ---- Setup solver ----
     PDSolverConfig config;
@@ -177,42 +211,47 @@ int main(int argc, char* argv[])
     config.gravity        = gravity;
     config.damping        = damping;
     config.use_chebyshev  = true;
+    config.use_cpu_stretch_reference = use_cpu_ref;
 
     PDSolver solver(config, mesh, sim_cons);
+    CpuStretchReferenceSolver cpu_ref_solver(mesh, sim_cons, pin_cons, dt, gravity, damping);
 
     // ---- Initial export ----
     if (!export_dir.empty()) {
         char fn[256];
         snprintf(fn, sizeof(fn), "%s/frame_0000.ply", export_dir.c_str());
-        export_ply(mesh, fn);
+        export_ply(mesh, fn, use_cpu_ref);
     }
 
     // ---- Simulation loop ----
     printf("\nSimulating...\n");
-    printf("Initial energy: %.6f\n", compute_energy(mesh, config));
+    printf("Initial energy: %.6f\n", compute_energy(mesh, config, use_cpu_ref));
 
     const int export_interval = std::max(1, steps / 10);
 
     for (int step = 1; step <= steps; ++step) {
-        solver.step(mesh, sim_cons, pin_cons);
+        if (use_cpu_ref)
+            cpu_ref_solver.step(mesh, pin_cons);
+        else
+            solver.step(mesh, sim_cons, pin_cons);
 
         if (verbose && step % 10 == 0)
-            printf("Step %d: Energy = %.6f\n", step, compute_energy(mesh, config));
+            printf("Step %d: Energy = %.6f\n", step, compute_energy(mesh, config, use_cpu_ref));
 
         if (!export_dir.empty() && step % export_interval == 0) {
             char fn[256];
             snprintf(fn, sizeof(fn), "%s/frame_%04d.ply",
                      export_dir.c_str(), step / export_interval);
-            export_ply(mesh, fn);
+            export_ply(mesh, fn, use_cpu_ref);
         }
     }
 
-    printf("Final energy: %.6f\n", compute_energy(mesh, config));
+    printf("Final energy: %.6f\n", compute_energy(mesh, config, use_cpu_ref));
 
     if (!export_dir.empty()) {
         char fn[256];
         snprintf(fn, sizeof(fn), "%s/frame_final.ply", export_dir.c_str());
-        export_ply(mesh, fn);
+        export_ply(mesh, fn, use_cpu_ref);
         printf("\nExported frames to %s/\n", export_dir.c_str());
     }
 

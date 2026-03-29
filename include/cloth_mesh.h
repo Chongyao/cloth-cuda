@@ -10,6 +10,7 @@
 
 #ifndef __CUDACC__
 #  include <Eigen/Dense>
+#  include <Eigen/Core>
 #  include <string>
 #  include <vector>
 #endif
@@ -36,8 +37,12 @@ struct ClothMesh {
 
     // ---- CPU FEM precomputed ----
     std::vector<Eigen::Matrix2f> Dm_inv;     // [T]  inverse reference edge matrix
+    std::vector<Eigen::Matrix2f> deltaUV;    // [T]  DiffCloth-style rest 2D edge matrix
+    std::vector<Eigen::Matrix<float, 6, 9>> dF_dx; // [T]  DiffCloth-style deformation derivative
     std::vector<float>           rest_area;  // [T]
     std::vector<float>           mass;       // [N]  lumped nodal mass
+    std::vector<Eigen::Vector3f> pos_cpu;    // [N]  current CPU positions for reference backend
+    std::vector<Eigen::Vector3f> vel_cpu;    // [N]  current CPU velocities for reference backend
 
     // ---- I/O ----
     bool load_obj(const std::string& path);

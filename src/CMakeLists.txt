@@ -5,6 +5,7 @@ add_library(cuda_ms_core STATIC
     cloth_mesh.cpp
     mesh_topology.cpp
     sim_constraints.cpp
+    stretch_reference.cpp
     mesh_generator.cpp
     constraints.cpp
 )

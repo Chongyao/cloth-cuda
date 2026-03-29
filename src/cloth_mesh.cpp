@@ -138,8 +138,12 @@ bool ClothMesh::load_obj(const std::string& path)
 void ClothMesh::precompute_rest_state(float density)
 {
     Dm_inv.resize(num_tris);
+    deltaUV.resize(num_tris);
+    dF_dx.resize(num_tris);
     rest_area.resize(num_tris);
     mass.assign(num_verts, 0.0f);
+    pos_cpu = rest_pos;
+    vel_cpu.assign(num_verts, Eigen::Vector3f::Zero());
 
     for (int t = 0; t < num_tris; ++t) {
         const int i0 = triangles[t](0);
@@ -153,21 +157,51 @@ void ClothMesh::precompute_rest_state(float density)
         Eigen::Vector3f e1 = X1 - X0;
         Eigen::Vector3f e2 = X2 - X0;
 
-        const float e1_len = e1.norm();
+        // DiffCloth-style rest frame construction.
+        // edgeVec = [X1-X0, X2-X0]
+        // P = orthonormal basis spanning the triangle plane via Gram-Schmidt
+        // deltaUV = P^T * edgeVec
+        // inv_deltaUV = deltaUV.inverse()
+        Eigen::Matrix<float, 3, 2> edgeVec;
+        edgeVec.col(0) = e1;
+        edgeVec.col(1) = e2;
 
-        // Project e2 onto local 2-D plane spanned by e1 (Gram-Schmidt)
-        const float proj  = e2.dot(e1) / e1_len;
-        const float perp2 = e2.squaredNorm() - proj * proj;
-        const float perp  = (perp2 > 0.0f) ? std::sqrt(perp2) : 0.0f;
+        Eigen::Matrix<float, 3, 2> P;
+        P.col(0) = e1.normalized();
+        Eigen::Vector3f ortho = e2 - e2.dot(P.col(0)) * P.col(0);
+        if (ortho.norm() > 1e-10f) {
+            P.col(1) = ortho.normalized();
+        } else {
+            // Degenerate triangle: arbitrary perpendicular basis
+            if (std::abs(P(0,0)) <= std::abs(P(1,0)) && std::abs(P(0,0)) <= std::abs(P(2,0)))
+                P.col(1) = Eigen::Vector3f(0.0f, -P(2,0), P(1,0)).normalized();
+            else
+                P.col(1) = Eigen::Vector3f(-P(1,0), P(0,0), 0.0f).normalized();
+        }
 
-        // Dm = [u1 | u2],  u1 = (e1_len, 0),  u2 = (proj, perp)
-        Eigen::Matrix2f Dm;
-        Dm.col(0) = Eigen::Vector2f(e1_len, 0.0f);
-        Dm.col(1) = Eigen::Vector2f(proj,   perp);
+        Eigen::Matrix2f Dm = P.transpose() * edgeVec;
+        deltaUV[t] = Dm;
+        Dm_inv[t]  = Dm.inverse();
 
         const float area = 0.5f * std::abs(Dm.determinant());
         rest_area[t] = area;
-        Dm_inv[t]    = Dm.inverse();
+
+        // DiffCloth-style dF/dx = kron(inv_deltaUV^T * p, I3)
+        // where p = [[-1, 1, 0],
+        //            [-1, 0, 1]]
+        Eigen::Matrix<float, 2, 3> p;
+        p << -1.0f, 1.0f, 0.0f,
+             -1.0f, 0.0f, 1.0f;
+        Eigen::Matrix<float, 2, 3> D = Dm_inv[t].transpose() * p;
+
+        Eigen::Matrix<float, 6, 9> deriv = Eigen::Matrix<float, 6, 9>::Zero();
+        for (int row = 0; row < 2; ++row) {
+            for (int v = 0; v < 3; ++v) {
+                const float coeff = D(row, v);
+                deriv.block<3,3>(row * 3, v * 3) = coeff * Eigen::Matrix3f::Identity();
+            }
+        }
+        dF_dx[t] = deriv;
 
         const float tri_mass = density * area;
         mass[i0] += tri_mass / 3.0f;
@@ -187,14 +221,22 @@ void ClothMesh::print_stats() const
     printf("  Triangles: %d\n", num_tris);
 
     if (!rest_area.empty()) {
-        float total_area = 0.0f;
-        for (float a : rest_area) total_area += a;
-        printf("  Total rest area : %.6f\n", total_area);
+        float total_area = 0.0f, min_area = rest_area[0], max_area = rest_area[0];
+        for (float a : rest_area) {
+            total_area += a;
+            min_area = std::min(min_area, a);
+            max_area = std::max(max_area, a);
+        }
+        printf("  Total rest area : %.6f (min=%.6f, max=%.6f)\n", total_area, min_area, max_area);
     }
     if (!mass.empty()) {
-        float total_mass = 0.0f;
-        for (float m : mass) total_mass += m;
-        printf("  Total mesh mass : %.6f\n", total_mass);
+        float total_mass = 0.0f, min_mass = mass[0], max_mass = mass[0];
+        for (float m : mass) {
+            total_mass += m;
+            min_mass = std::min(min_mass, m);
+            max_mass = std::max(max_mass, m);
+        }
+        printf("  Total mesh mass : %.6f (min=%.6f, max=%.6f)\n", total_mass, min_mass, max_mass);
     }
 
     const int sample = std::min(num_tris, 3);

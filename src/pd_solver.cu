@@ -125,7 +125,9 @@ __global__ void tri_stretch_project_kernel(
 
     // Eigenvectors of A (right singular vectors V of F_2D)
     float v1x, v1y, v2x, v2y;
-    if (disc < 1e-10f) {
+    if (disc < 1e-10f || fabsf(A01) < 1e-10f) {
+        // Matrix is effectively diagonal (or isotropic)
+        // Eigenvectors are the standard basis
         v1x = 1.0f; v1y = 0.0f;
         v2x = 0.0f; v2y = 1.0f;
     } else {

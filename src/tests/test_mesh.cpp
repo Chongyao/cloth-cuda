@@ -27,19 +27,45 @@ int main() {
             const int i1 = mesh.triangles[t](1);
             const int i2 = mesh.triangles[t](2);
 
-            const Eigen::Vector3f e1 = mesh.rest_pos[i1] - mesh.rest_pos[i0];
-            const Eigen::Vector3f e2 = mesh.rest_pos[i2] - mesh.rest_pos[i0];
+            Eigen::Matrix<float, 3, 2> edgeVec;
+            edgeVec.col(0) = mesh.rest_pos[i1] - mesh.rest_pos[i0];
+            edgeVec.col(1) = mesh.rest_pos[i2] - mesh.rest_pos[i0];
 
-            const float e1_len = e1.norm();
-            const float proj   = e2.dot(e1) / e1_len;
-            const float perp   = std::sqrt(std::max(0.0f, e2.squaredNorm() - proj * proj));
+            Eigen::Vector3f p0 = edgeVec.col(0).normalized();
+            Eigen::Vector3f ortho = edgeVec.col(1) - edgeVec.col(1).dot(p0) * p0;
+            Eigen::Vector3f p1 = ortho.normalized();
+            Eigen::Matrix<float, 3, 2> P;
+            P.col(0) = p0;
+            P.col(1) = p1;
 
-            Eigen::Matrix2f Dm;
-            Dm.col(0) = Eigen::Vector2f(e1_len, 0.0f);
-            Dm.col(1) = Eigen::Vector2f(proj, perp);
-
+            Eigen::Matrix2f Dm = P.transpose() * edgeVec;
             const float err = (mesh.Dm_inv[t] * Dm - Eigen::Matrix2f::Identity()).norm();
             CHECK(err < 1e-4f);
+        }
+    }
+
+    SECTION("dF_dx maps rest pose to Dm_inv-consistent F");
+    {
+        for (int t = 0; t < std::min(mesh.num_tris, 10); ++t) {
+            const int i0 = mesh.triangles[t](0);
+            const int i1 = mesh.triangles[t](1);
+            const int i2 = mesh.triangles[t](2);
+            Eigen::Matrix<float, 9, 1> x;
+            x.segment<3>(0) = mesh.rest_pos[i0];
+            x.segment<3>(3) = mesh.rest_pos[i1];
+            x.segment<3>(6) = mesh.rest_pos[i2];
+
+            Eigen::Matrix<float, 6, 1> Fvec = mesh.dF_dx[t] * x;
+
+            Eigen::Matrix<float, 3, 2> Ds;
+            Ds.col(0) = mesh.rest_pos[i1] - mesh.rest_pos[i0];
+            Ds.col(1) = mesh.rest_pos[i2] - mesh.rest_pos[i0];
+            Eigen::Matrix<float, 3, 2> F = Ds * mesh.Dm_inv[t];
+            Eigen::Matrix<float, 6, 1> expected;
+            expected.segment<3>(0) = F.col(0);
+            expected.segment<3>(3) = F.col(1);
+
+            CHECK((Fvec - expected).norm() < 1e-4f);
         }
     }
 
