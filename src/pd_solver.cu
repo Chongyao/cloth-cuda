@@ -3,6 +3,9 @@
 #include "sim_constraints.h"
 #include "constraints.h"
 #include "utils/cuda_helper.h"
+#ifndef __CUDACC__
+#include "stretch_reference.h"
+#endif
 
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
@@ -447,10 +450,22 @@ PDSolver::PDSolver(const PDSolverConfig& config,
     , num_tris_(mesh.num_tris)
     , num_bend_cons_(sim_cons.num_bend_cons)
 {
+#ifndef __CUDACC__
+    if (config_.use_cpu_stretch_reference) {
+        cpu_stretch_ref_ = new CpuStretchReferenceSolver(mesh, sim_cons, Constraints{}, config_.dt, config_.gravity, config_.damping);
+        return;
+    }
+#endif
     allocate_buffers(num_verts_, num_tris_, num_bend_cons_);
 }
 
-PDSolver::~PDSolver() { free_buffers(); }
+PDSolver::~PDSolver() {
+#ifndef __CUDACC__
+    delete cpu_stretch_ref_;
+    cpu_stretch_ref_ = nullptr;
+#endif
+    free_buffers();
+}
 
 void PDSolver::allocate_buffers(int N, int T, int E_bend)
 {
@@ -482,6 +497,15 @@ void PDSolver::step(ClothMesh& mesh,
                     const SimConstraints& sim_cons,
                     const Constraints& pin_cons)
 {
+#ifndef __CUDACC__
+    if (config_.use_cpu_stretch_reference) {
+        if (!cpu_stretch_ref_)
+            cpu_stretch_ref_ = new CpuStretchReferenceSolver(mesh, sim_cons, pin_cons, config_.dt, config_.gravity, config_.damping);
+        cpu_stretch_ref_->step(mesh, pin_cons);
+        return;
+    }
+#endif
+
     const int   N   = num_verts_;
     const int   T   = num_tris_;
     const int   Eb  = num_bend_cons_;

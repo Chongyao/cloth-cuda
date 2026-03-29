@@ -213,8 +213,13 @@ int main(int argc, char* argv[])
     config.use_chebyshev  = true;
     config.use_cpu_stretch_reference = use_cpu_ref;
 
-    PDSolver solver(config, mesh, sim_cons);
-    CpuStretchReferenceSolver cpu_ref_solver(mesh, sim_cons, pin_cons, dt, gravity, damping);
+    PDSolver* gpu_solver = nullptr;
+    CpuStretchReferenceSolver* cpu_ref_solver = nullptr;
+    if (use_cpu_ref) {
+        cpu_ref_solver = new CpuStretchReferenceSolver(mesh, sim_cons, pin_cons, dt, gravity, damping);
+    } else {
+        gpu_solver = new PDSolver(config, mesh, sim_cons);
+    }
 
     // ---- Initial export ----
     if (!export_dir.empty()) {
@@ -231,9 +236,9 @@ int main(int argc, char* argv[])
 
     for (int step = 1; step <= steps; ++step) {
         if (use_cpu_ref)
-            cpu_ref_solver.step(mesh, pin_cons);
+            cpu_ref_solver->step(mesh, pin_cons);
         else
-            solver.step(mesh, sim_cons, pin_cons);
+            gpu_solver->step(mesh, sim_cons, pin_cons);
 
         if (verbose && step % 10 == 0)
             printf("Step %d: Energy = %.6f\n", step, compute_energy(mesh, config, use_cpu_ref));
@@ -247,6 +252,9 @@ int main(int argc, char* argv[])
     }
 
     printf("Final energy: %.6f\n", compute_energy(mesh, config, use_cpu_ref));
+
+    delete gpu_solver;
+    delete cpu_ref_solver;
 
     if (!export_dir.empty()) {
         char fn[256];
