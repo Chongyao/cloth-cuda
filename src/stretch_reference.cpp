@@ -141,8 +141,9 @@ void CpuStretchReferenceSolver::step(ClothMesh& mesh, const Constraints& pin_con
 {
     const int dof = num_verts_ * 3;
     const float h2 = dt_ * dt_;
+    const int max_iters = 50;  // PD iterations per frame
 
-    VecXf x_old(dof), y(dof), rhs(dof);
+    VecXf x_old(dof), y(dof), rhs(dof), x_new(dof);
     for (int i = 0; i < num_verts_; ++i) {
         const Vec3f pos = mesh.pos_cpu[i];
         const Vec3f vel = mesh.vel_cpu[i];
@@ -152,15 +153,26 @@ void CpuStretchReferenceSolver::step(ClothMesh& mesh, const Constraints& pin_con
         y(i * 3 + 2) = pos.z() + dt_ * vel.z();
     }
 
+    // Precompute pinned vertex DOF indices for efficient constraint application
+    std::vector<int> pinned_dofs;
+    for (int idx : pin_cons.pinned_indices) {
+        for (int d = 0; d < 3; ++d)
+            pinned_dofs.push_back(idx * 3 + d);
+    }
+
     std::vector<float> proj_storage(num_tris_ * 6, 0.0f);
-    for (int iter = 0; iter < 1; ++iter) {
+
+    for (int iter = 0; iter < max_iters; ++iter) {
+        // Local step: project each triangle to manifold
         for (int t = 0; t < num_tris_; ++t)
             project_triangle_to_manifold(x_old.data(), t, &proj_storage[t * 6]);
 
+        // Global step: build and solve linear system
         std::vector<Triplet> trips;
         trips.reserve(num_verts_ * 3 + num_tris_ * 81);
         rhs.setZero();
 
+        // Mass matrix and inertial term
         for (int i = 0; i < num_verts_; ++i) {
             const float m = masses_[i];
             for (int d = 0; d < 3; ++d) {
@@ -170,6 +182,7 @@ void CpuStretchReferenceSolver::step(ClothMesh& mesh, const Constraints& pin_con
             }
         }
 
+        // Stretch constraint contributions
         for (int t = 0; t < num_tris_; ++t) {
             const float weight = std::sqrt(std::max(0.0f, stretch_k_[t] * rest_area_[t]));
             if (weight == 0.0f) continue;
@@ -203,40 +216,66 @@ void CpuStretchReferenceSolver::step(ClothMesh& mesh, const Constraints& pin_con
             }
         }
 
+        // Build sparse matrix (without pinned vertices constraints yet)
         SparseMat K(dof, dof);
         K.setFromTriplets(trips.begin(), trips.end(), [](float a, float b) { return a + b; });
-        K.makeCompressed();
 
-        // Strongly enforce pinned vertices by zeroing row/col and setting diag=1.
+        // Apply pinned constraints by modifying system after makeCompressed
+        // This is more reliable than modifying after compression
         for (int idx : pin_cons.pinned_indices) {
-            assert(idx >= 0 && idx < num_verts_);
             for (int d = 0; d < 3; ++d) {
                 const int row = idx * 3 + d;
-                for (int col = 0; col < K.outerSize(); ++col) {
-                    for (SparseMat::InnerIterator it(K, col); it; ++it) {
-                        if (it.row() == row || it.col() == row) {
-                            if (it.row() == row && it.col() == row) it.valueRef() = 1.0f;
-                            else it.valueRef() = 0.0f;
-                        }
-                    }
-                }
                 rhs(row) = pin_cons.target_positions[row];
             }
         }
 
-        Eigen::SimplicialLDLT<SparseMat> solver;
-        solver.compute(K);
-        if (solver.info() != Eigen::Success) return;
-        VecXf x_new = solver.solve(rhs);
-        if (solver.info() != Eigen::Success) return;
+        // Solve using LDLT with constraints enforced via matrix modification
+        // Zero out rows/cols for pinned vertices and set diagonal to 1
+        std::vector<Triplet> K_trips;
+        for (int k = 0; k < K.outerSize(); ++k) {
+            for (SparseMat::InnerIterator it(K, k); it; ++it) {
+                int row = it.row();
+                int col = it.col();
+                bool row_pinned = std::find(pinned_dofs.begin(), pinned_dofs.end(), row) != pinned_dofs.end();
+                bool col_pinned = std::find(pinned_dofs.begin(), pinned_dofs.end(), col) != pinned_dofs.end();
 
-        for (int i = 0; i < num_verts_; ++i) {
-            Vec3f oldp = get_vertex(x_old, i);
-            Vec3f newp = get_vertex(x_new, i);
-            mesh.vel_cpu[i] = (newp - oldp) * ((1.0f - damping_) / dt_);
-            mesh.pos_cpu[i] = newp;
-            x_old.segment<3>(i * 3) = newp;
+                if (row_pinned && col_pinned && row == col) {
+                    K_trips.emplace_back(row, col, 1.0f);  // Diagonal for pinned
+                } else if (row_pinned || col_pinned) {
+                    // Zero out off-diagonal terms involving pinned vertices
+                    K_trips.emplace_back(row, col, 0.0f);
+                } else {
+                    K_trips.emplace_back(row, col, it.value());
+                }
+            }
         }
+
+        SparseMat K_constrained(dof, dof);
+        K_constrained.setFromTriplets(K_trips.begin(), K_trips.end());
+        K_constrained.makeCompressed();
+
+        Eigen::SimplicialLDLT<SparseMat> solver;
+        solver.compute(K_constrained);
+        if (solver.info() != Eigen::Success) {
+            fprintf(stderr, "CPU solver: factorization failed at iter %d\n", iter);
+            return;
+        }
+        x_new = solver.solve(rhs);
+        if (solver.info() != Eigen::Success) {
+            fprintf(stderr, "CPU solver: solve failed at iter %d\n", iter);
+            return;
+        }
+
+        // Update for next iteration
+        x_old = x_new;
+    }
+
+    // Final update to mesh
+    for (int i = 0; i < num_verts_; ++i) {
+        Vec3f oldp = mesh.pos_cpu[i];
+        Vec3f newp = get_vertex(x_old, i);
+        mesh.vel_cpu[i] = (newp - oldp) * ((1.0f - damping_) / dt_);
+        mesh.pos_cpu[i] = newp;
     }
 }
 
